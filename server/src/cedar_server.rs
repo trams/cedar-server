@@ -1759,6 +1759,8 @@ async fn async_main(
     >,
     default_total_binning: Option<u32>,
 ) {
+    info!("Hello world from info");
+    println!("Hello world from println");
     // If any thread panics, bail out.
     std::panic::set_hook(Box::new(|panic_info| {
         error!("Thread panicked: {}", panic_info);

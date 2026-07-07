@@ -1546,7 +1546,17 @@ impl Cedar for MyCedar {
         }
         if req.save_image.unwrap_or(false) {
             let solve_engine = self.state.lock().await.solve_engine.clone();
-            let result = solve_engine.lock().await.save_image().await;
+            // If a benchmark corpus dir is configured, land the frame there
+            // (with a manifest row); otherwise keep the legacy debug behavior
+            // of writing to the server's run directory.
+            let bench_dir = std::env::var_os("CEDAR_BENCH_DIR")
+                .filter(|d| !d.is_empty())
+                .map(std::path::PathBuf::from);
+            let result = solve_engine
+                .lock()
+                .await
+                .save_image(bench_dir.as_deref())
+                .await;
             if let Err(x) = result {
                 return Err(tonic_status(x));
             }
@@ -4689,6 +4699,8 @@ async fn async_main(
     >,
     default_total_binning: Option<u32>,
 ) {
+    info!("Hello world from info");
+    println!("Hello world from println");
     // If any thread panics, bail out.
     std::panic::set_hook(Box::new(|panic_info| {
         error!("Thread panicked: {}", panic_info);

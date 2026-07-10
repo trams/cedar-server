@@ -44,6 +44,9 @@ image = "0.25.2"
 imageproc = "0.27.0"
 log = "0.4.19"
 nix = { version = "0.28.0", features = ["time"] }
+# Matches the numeris tetra3rs re-exports as `tetra3::Quaternion`; used to build a
+# tracking-mode attitude hint via the same rotation-matrix convention.
+numeris = "0.5.14"
 pico-args = "0.5.0"
 prost = "0.12.3"
 prost-types = "0.12.3"

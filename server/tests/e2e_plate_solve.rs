@@ -113,7 +113,12 @@ async fn gate1_single_field() {
         p.roll,
         expected_roll_deg(field.rotation_deg)
     );
-    println!("  fov             {:.4} (gt {:.4})", p.fov, field.fov_x_deg);
+    println!(
+        "  fov             {:.4} (gt {:.4} gnomonic; manifest fov_x_deg {:.4})",
+        p.fov,
+        field.true_fov_x_deg(),
+        field.fov_x_deg
+    );
 
     let o = evaluate(field, &ps);
     println!(

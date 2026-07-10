@@ -23,6 +23,22 @@ pub struct Field {
     pub n_rendered: i32,
 }
 
+impl Field {
+    /// The field's true horizontal FOV, in degrees.
+    ///
+    /// NOT `fov_x_deg`. The manifest records `fov_x_deg = nx * pixscale`
+    /// (synthstars.py:149), a small-angle approximation, but the image is
+    /// rendered on a TAN/gnomonic WCS (synthstars.py:41), whose true angular
+    /// width is `2 * atan(nx/2 * pixscale)`. At this corpus's 12.71 deg the two
+    /// differ by -0.4071%, which is exactly the "0.4%-low FOV bias" previously
+    /// attributed to tetra3. Both tetra3 and tetra3rs report this value; the
+    /// manifest column is what is wrong.
+    pub fn true_fov_x_deg(&self) -> f64 {
+        let pixscale_rad = (self.pixscale_arcsec / 3600.0).to_radians();
+        (2.0 * ((self.nx as f64 / 2.0) * pixscale_rad).atan()).to_degrees()
+    }
+}
+
 /// The exact header the generator (cedar-solve/tools/gen_corpus.py) writes.
 /// Parsing is positional, so a header drift must be a hard error rather than a
 /// silent column shift.
@@ -220,6 +236,24 @@ mod tests {
         assert_eq!(f.nx, 1920);
         assert_eq!(f.ny, 1080);
         assert_eq!(f.n_rendered, 70);
+    }
+
+    /// The manifest's fov_x_deg is `nx * pixscale` (small-angle); the true FOV
+    /// of a TAN-projected image is `2*atan(nx/2 * pixscale)`. They differ by
+    /// -0.4071% here, which is the entire "tetra3 FOV bias". Pin both, so the
+    /// distinction cannot be quietly undone.
+    #[test]
+    fn true_fov_is_gnomonic_not_small_angle() {
+        let f = &parse_manifest(SAMPLE).expect("parse")[0];
+
+        // The manifest column is exactly the small-angle product.
+        assert!((f.fov_x_deg - f.nx as f64 * f.pixscale_arcsec / 3600.0).abs() < 1e-9);
+
+        let true_fov = f.true_fov_x_deg();
+        assert!((true_fov - 12.658_26).abs() < 1e-4, "got {true_fov}");
+
+        let rel = (true_fov - f.fov_x_deg) / f.fov_x_deg;
+        assert!((rel + 0.004_071).abs() < 1e-5, "relative offset {rel}");
     }
 
     #[test]

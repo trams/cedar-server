@@ -3594,6 +3594,19 @@ impl MyCedar {
             )
             .unwrap(),
         ));
+        // Tracking mode: seed each solve with the previous frame's attitude so a
+        // tracking-capable solver (tetra3rs) solves sparse/low-SNR frames the blind
+        // search misses. Harmless for the Python tetra3 backend, which ignores the
+        // hint. On by default; set CEDAR_TRACKING=0 to force pure lost-in-space.
+        let use_tracking = !matches!(
+            std::env::var("CEDAR_TRACKING").ok().as_deref(),
+            Some("0") | Some("false")
+        );
+        solve_engine
+            .lock()
+            .await
+            .set_use_attitude_hint(use_tracking)
+            .await;
         // Shared calibration data arc: used by both CedarState and ServeContext
         // so the serve engine always reads up-to-date calibration results.
         let shared_calibration_data = Arc::new(tokio::sync::Mutex::new(

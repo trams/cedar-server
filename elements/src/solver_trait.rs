@@ -20,7 +20,7 @@ pub struct SolveExtension {
     pub return_rotation_matrix: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SolveParams {
     // See tetra3.py for descriptions of fields.
 
@@ -34,6 +34,15 @@ pub struct SolveParams {
     pub solve_timeout: Option<Duration>,  // Default determined by implementation.
     pub distortion: Option<f64>,
     pub match_max_error: Option<f64>,  // Defaults to pattern_max_error from database.
+
+    // Prior estimate of the camera's attitude (boresight ra/dec and roll), used
+    // by tracking-capable solvers to skip a blind lost-in-space search and solve
+    // by direct correspondence against the hinted pointing. In the Operate loop
+    // this is the previous frame's solution (see SolveEngine::set_use_attitude_hint).
+    // Solvers that do not support tracking (e.g. the Python tetra3 backend) ignore
+    // it. Distinct from `imu_estimate`, which is derived from IMU fusion; a solver
+    // may honor either.
+    pub attitude_hint: Option<EquatorialCoordinates>,
 }
 
 // See tetra3.py in cedar-solve for description of args.

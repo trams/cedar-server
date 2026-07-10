@@ -45,6 +45,13 @@ use crate::detect_engine::{DetectEngine, DetectResult};
 const IMU_INTERPOLATION_INTERVAL: Duration = Duration::from_millis(100);
 const MINIMUM_STARS: usize = 4;
 
+// Oldest a previous solution may be to seed the next solve as a tracking-mode
+// attitude hint (see `set_use_attitude_hint`). Past this, the mount may have
+// slewed far enough that the hint is worse than useless, so we let the solver run
+// blind. A hint that survives this gate but is still wrong merely costs a failed
+// tracking attempt before the lost-in-space fallback, never a lost solve.
+const MAX_HINT_AGE: Duration = Duration::from_secs(5);
+
 // Configuration for the server-side benchmark-corpus capture (see
 // `docs/00-task-collecting-real-images.md`). Present only when the
 // CEDAR_BENCH_DIR environment variable is set; otherwise capture is disabled.
@@ -447,6 +454,10 @@ struct SolveState {
 
     imu_tracker: Option<Arc<tokio::sync::Mutex<dyn ImuTrait + Send>>>,
     use_imu_tracker: bool,
+    // When set, each solve seeds the solver with the previous frame's attitude as
+    // a tracking-mode hint (see `set_use_attitude_hint`). Off by default so the
+    // e2e harnesses measure lost-in-space behavior; production turns it on.
+    use_attitude_hint: bool,
     observer_location: Option<LatLong>,
 
     frame_id: Option<i32>,
@@ -517,6 +528,7 @@ impl SolveEngine {
                 eyepiece_fov: 1.0,
                 imu_tracker: imu_tracker.clone(),
                 use_imu_tracker: imu_tracker.is_some(),
+                use_attitude_hint: false,
                 observer_location,
                 frame_id: None,
                 fov_estimate: None,
@@ -687,6 +699,15 @@ impl SolveEngine {
                 imu_tracker.lock().await.reset().await;
             }
         }
+    }
+
+    // Enables tracking mode: each star-based solve is seeded with the previous
+    // frame's attitude as a hint, so a tracking-capable solver (tetra3rs) can
+    // skip the blind lost-in-space search and solve sparse/low-SNR fields it would
+    // otherwise miss. Harmless for solvers that ignore the hint (the Python tetra3
+    // backend). Off by default; production enables it for the Operate loop.
+    pub async fn set_use_attitude_hint(&mut self, use_attitude_hint: bool) {
+        self.state.lock().await.use_attitude_hint = use_attitude_hint;
     }
 
     pub async fn clear_plate_solution(&mut self) {
@@ -993,6 +1014,49 @@ impl SolveEngine {
             }
         } else {
             None
+        };
+
+        // Tracking-mode attitude hint: seed the solver with the previous frame's
+        // pointing so a tracking-capable solver can solve by direct
+        // correspondence. Only for real star-based solves, only when enabled, and
+        // only if the previous solution's frame is recent enough that the mount
+        // cannot have slewed away (measured between frame readouts, so a slow
+        // solve does not falsely age the hint out).
+        let attitude_hint = if skip_stars || !have_stars {
+            None
+        } else {
+            let locked_state = state.lock().await;
+            if !locked_state.use_attitude_hint {
+                None
+            } else {
+                locked_state.plate_solution.as_ref().and_then(|prev| {
+                    let fresh = image_time
+                        .duration_since(prev.detect_result.captured_image.readout_time)
+                        .map(|age| age <= MAX_HINT_AGE)
+                        .unwrap_or(false);
+                    if !fresh {
+                        return None;
+                    }
+                    let proto = prev.plate_solution.as_ref()?;
+                    let coord = proto.image_sky_coord.as_ref()?;
+                    Some(EquatorialCoordinates {
+                        north_roll_angle: proto.roll,
+                        ra: coord.ra,
+                        dec: coord.dec,
+                    })
+                })
+            }
+        };
+
+        // Fold the hint into the solve parameters without mutating the caller's.
+        let effective_params;
+        let solve_params = if let Some(hint) = attitude_hint {
+            let mut p = solve_params.clone();
+            p.attitude_hint = Some(hint);
+            effective_params = p;
+            &effective_params
+        } else {
+            solve_params
         };
 
         let mut plate_solution_proto: Option<PlateSolutionProto> = None;

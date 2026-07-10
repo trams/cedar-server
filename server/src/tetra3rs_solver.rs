@@ -42,8 +42,10 @@ use cedar_elements::cedar_common::CelestialCoord;
 use cedar_elements::imu_trait::EquatorialCoordinates;
 use cedar_elements::solver_trait::{SolveExtension, SolveParams, SolverTrait};
 
+use numeris::Matrix3;
 use tetra3::{
-    Centroid, GenerateDatabaseConfig, Solution, SolveConfig, SolveStatus, SolverDatabase,
+    Centroid, GenerateDatabaseConfig, Quaternion, Solution, SolveConfig, SolveStatus,
+    SolverDatabase,
 };
 
 /// Matches `Tetra3Solver::default_timeout()`, so swapping solvers does not
@@ -68,6 +70,17 @@ const SEED_COVERS_ABOVE: f64 = 1.75;
 
 /// Guards against a pathological database range producing an unbounded ladder.
 const MAX_BLIND_SEEDS: usize = 8;
+
+/// Angular uncertainty attached to a tracking-mode attitude hint. tetra3rs uses
+/// it to size the catalog cone and the pixel-space nearest-neighbor match radius.
+///
+/// The hints cedar supplies are the previous frame's pointing (frame-to-frame
+/// drift ~0.01 deg while tracking, arcminutes of prior-solve pointing error), so
+/// 1 deg is generous while keeping the match radius tight enough to avoid spurious
+/// correspondences. A hint wrong by more than this fails tracking and falls back
+/// to the blind lost-in-space search, so it is a performance knob, not a
+/// correctness one. Matches tetra3rs's own default.
+const HINT_UNCERTAINTY_DEG: f32 = 1.0;
 
 /// Generates a solver database from a merged Gaia DR3 + Hipparcos catalog
 /// (`gaia_merged.bin`), spanning `[min_fov_deg, max_fov_deg]`.
@@ -150,6 +163,66 @@ pub fn tetra3_rotation_matrix(solution: &Solution) -> [f64; 9] {
     ]
 }
 
+/// Cross product of two 3-vectors.
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Builds a tetra3rs attitude quaternion (`qicrs2cam`, the convention of
+/// [`Solution::qicrs2cam`]) from a boresight sky position and roll, for use as a
+/// tracking-mode [`SolveConfig::attitude_hint`].
+///
+/// This inverts the pose the adapter *reports*: `ra_deg`/`dec_deg` are the
+/// image-center pointing (`Solution::pixel_to_world(0, 0)`), and `roll_deg` is
+/// cedar's north position angle as produced by [`roll_deg`]. Reconstructing the
+/// attitude from those three numbers is exact enough for a hint -- tracking uses
+/// it only to center a catalog cone and to project stars for a nearest-neighbor
+/// match, both slackened by `hint_uncertainty_rad`, and then refits the attitude
+/// by SVD.
+///
+/// `qicrs2cam.to_rotation_matrix()` maps ICRS vectors into the camera frame
+/// (+X right, +Y down, +Z boresight), so its rows are the camera axes expressed
+/// in ICRS: row 0 = +X, row 1 = +Y, row 2 = boresight (see `track.rs` and
+/// [`tetra3_rotation_matrix`]). We build those three ICRS rows and pass them to
+/// `Quaternion::from_rotation_matrix`, the exact inverse of `to_rotation_matrix`.
+///
+/// Roll enters through `theta_rad = (roll - 180) deg` (the inverse of
+/// [`roll_deg`]): camera +X lies in the tangent plane at angle `theta` from the
+/// East axis toward North.
+pub fn attitude_to_quaternion(ra_deg: f64, dec_deg: f64, roll_deg: f64) -> Quaternion {
+    let ra = ra_deg.to_radians();
+    let dec = dec_deg.to_radians();
+    let theta = (roll_deg - 180.0).to_radians();
+
+    // Boresight (+Z_cam) in ICRS.
+    let b = [dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin()];
+    // Tangent-plane basis at the boresight: East (increasing RA), North
+    // (increasing Dec). Orthonormal and perpendicular to the boresight.
+    let east = [-ra.sin(), ra.cos(), 0.0];
+    let north = [-dec.sin() * ra.cos(), -dec.sin() * ra.sin(), dec.cos()];
+
+    // Camera +X (image right): theta from East toward North.
+    let (st, ct) = (theta.sin(), theta.cos());
+    let x = [
+        ct * east[0] + st * north[0],
+        ct * east[1] + st * north[1],
+        ct * east[2] + st * north[2],
+    ];
+    // Camera +Y (image down) completes the right-handed frame (X x Y = Z = b).
+    let y = cross(b, x);
+
+    let m = Matrix3::<f32>::new([
+        [x[0] as f32, x[1] as f32, x[2] as f32],
+        [y[0] as f32, y[1] as f32, y[2] as f32],
+        [b[0] as f32, b[1] as f32, b[2] as f32],
+    ]);
+    Quaternion::from_rotation_matrix(&m)
+}
+
 /// The FOV seeds to try, in order, for one solve.
 ///
 /// A known FOV (from the calibrator, or configured for the box camera) yields a
@@ -200,6 +273,10 @@ struct SolveInputs {
     match_radius: f32,
     match_threshold: f64,
     match_max_error: Option<f32>,
+    /// Tracking-mode attitude hint (`qicrs2cam`). When set, tetra3rs attempts a
+    /// direct-correspondence solve against it before falling back to the blind
+    /// pattern-hash search.
+    attitude_hint: Option<Quaternion>,
     timeout: Duration,
     target_pixels: Vec<ImageCoord>,
     target_sky_coords: Vec<CelestialCoord>,
@@ -326,6 +403,16 @@ fn solve_blocking(
         // benchmarks/take1 it recovers frames that 0.001 loses, regresses nothing,
         // and costs ~0.02 ms.
         config.match_max_error = inputs.match_max_error;
+
+        // Tracking mode: with a hint set, tetra3rs solves by direct
+        // correspondence against the hinted attitude (sub-millisecond, robust to
+        // the sparse/low-SNR fields the pattern hash misses) and falls back to
+        // lost-in-space on failure. strict_hint stays false so a stale or wrong
+        // hint can never lose a frame the blind search would have solved.
+        if let Some(hint) = inputs.attitude_hint {
+            config.attitude_hint = Some(hint);
+            config.hint_uncertainty_rad = HINT_UNCERTAINTY_DEG.to_radians();
+        }
 
         match db.solve_from_centroids(&inputs.centroids, &config) {
             Ok(solution) => {
@@ -524,10 +611,18 @@ impl SolverTrait for Tetra3RsSolver {
         height: usize,
         extension: &SolveExtension,
         params: &SolveParams,
-        _imu_estimate: Option<EquatorialCoordinates>,
+        imu_estimate: Option<EquatorialCoordinates>,
     ) -> Result<PlateSolution, CanonicalError> {
         // A fresh solve is not retroactively canceled by an earlier cancel().
         self.cancel.store(false, Ordering::Relaxed);
+
+        // Tracking-mode hint: the engine's explicit previous-frame attitude wins;
+        // fall back to an IMU-fused estimate if that is all that is available.
+        // Both are EquatorialCoordinates (boresight ra/dec + north-up roll), which
+        // is exactly what attitude_to_quaternion inverts.
+        let attitude_hint = params.attitude_hint.or(imu_estimate).map(|ec| {
+            attitude_to_quaternion(ec.ra, ec.dec, ec.north_roll_angle)
+        });
 
         // tetra3rs centroids are measured from the image center, +X right, +Y
         // down; cedar's ImageCoord origin is the top-left corner.
@@ -574,6 +669,7 @@ impl SolverTrait for Tetra3RsSolver {
             match_radius: params.match_radius.unwrap_or(0.01) as f32,
             match_threshold: params.match_threshold.unwrap_or(1e-5),
             match_max_error: params.match_max_error.map(|e| e as f32),
+            attitude_hint,
             timeout: params.solve_timeout.unwrap_or(DEFAULT_TIMEOUT),
             target_pixels: extension.target_pixel.clone().unwrap_or_default(),
             target_sky_coords: extension.target_sky_coord.clone().unwrap_or_default(),
@@ -736,6 +832,90 @@ mod tests {
 
         let down = mat_vec(&m, axis_icrs([0.0, 1.0, 0.0]));
         assert!(close(down, [0.0, 0.0, -1.0]), "image down -> {down:?}");
+    }
+
+    // ---- attitude hint ---------------------------------------------------
+
+    fn row(m: &numeris::Matrix3<f32>, r: usize) -> [f64; 3] {
+        [m[(r, 0)] as f64, m[(r, 1)] as f64, m[(r, 2)] as f64]
+    }
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    /// The reconstructed attitude must point its boresight at (ra, dec) and be a
+    /// proper rotation. Boresight placement is the half of the convention that is
+    /// checkable without a solve; the roll sign is anchored end-to-end against a
+    /// real tetra3rs solve in `e2e_tetra3rs_tracking.rs`.
+    #[test]
+    fn attitude_hint_boresight_matches_radec() {
+        for (ra, dec) in [
+            (0.0, 0.0),
+            (123.4, -25.0),
+            (359.9, 89.0),
+            (221.0, -25.0),
+            (270.0, -89.5),
+        ] {
+            let q = attitude_to_quaternion(ra, dec, 137.0);
+            let m = q.to_rotation_matrix();
+            let (rr, dr) = (ra.to_radians(), dec.to_radians());
+            let want = [dr.cos() * rr.cos(), dr.cos() * rr.sin(), dr.sin()];
+            let boresight = row(&m, 2); // row 2 = boresight (see track.rs).
+            let cos_sep = dot(boresight, want).clamp(-1.0, 1.0);
+            assert!(
+                cos_sep > 0.999_999,
+                "ra {ra} dec {dec}: boresight off by {:.4}'",
+                cos_sep.acos().to_degrees() * 60.0
+            );
+        }
+    }
+
+    /// `roll` recovered from the reconstructed attitude with the convention
+    /// `roll_deg` documents (theta = angle East->camera-+X) round-trips. This
+    /// pins that `attitude_to_quaternion` is the exact inverse of the pose the
+    /// adapter reports.
+    #[test]
+    fn attitude_hint_roll_round_trips() {
+        for &(ra, dec) in &[(50.0, 10.0), (221.0, -25.0), (200.0, 60.0)] {
+            for roll in [0.0, 37.0, 179.9, 200.0, 350.0] {
+                let q = attitude_to_quaternion(ra, dec, roll);
+                let m = q.to_rotation_matrix();
+                let (rr, dr) = (ra.to_radians(), dec.to_radians());
+                let east = [-rr.sin(), rr.cos(), 0.0];
+                let north = [-dr.sin() * rr.cos(), -dr.sin() * rr.sin(), dr.cos()];
+                let x = row(&m, 0); // row 0 = camera +X (image right).
+                let theta = dot(x, north).atan2(dot(x, east));
+                let got = normalize_deg(theta.to_degrees() + 180.0);
+                let want = normalize_deg(roll);
+                let err = (got - want).abs().min(360.0 - (got - want).abs());
+                assert!(err < 1e-3, "ra {ra} dec {dec} roll {roll}: got {got}");
+            }
+        }
+    }
+
+    /// Whatever the inputs, the hint must be a proper rotation (det +1,
+    /// orthonormal rows) or tetra3rs's projection would mirror the sky.
+    #[test]
+    fn attitude_hint_is_a_proper_rotation() {
+        for &(ra, dec, roll) in &[
+            (0.0, 0.0, 0.0),
+            (123.0, 45.0, 210.0),
+            (300.0, -60.0, 95.0),
+            (359.0, 89.0, 15.0),
+        ] {
+            let m = attitude_to_quaternion(ra, dec, roll).to_rotation_matrix();
+            let rows = [row(&m, 0), row(&m, 1), row(&m, 2)];
+            for r in 0..3 {
+                assert!((dot(rows[r], rows[r]) - 1.0).abs() < 1e-5, "row {r} not unit");
+                for c in (r + 1)..3 {
+                    assert!(dot(rows[r], rows[c]).abs() < 1e-5, "rows {r},{c} not orthogonal");
+                }
+            }
+            // Right-handed: row0 x row1 == row2.
+            let x_cross_y = cross(rows[0], rows[1]);
+            assert!(dot(x_cross_y, rows[2]) > 0.999_99, "not right-handed");
+        }
     }
 
     // ---- FOV seeds -------------------------------------------------------

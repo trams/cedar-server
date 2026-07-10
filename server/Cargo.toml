@@ -7,6 +7,10 @@ edition = "2021"
 name = "cedar-box-server"
 path = "src/bin/cedar_box_server.rs"
 
+[[bin]] # Build tool: generates the pattern database for --solver tetra3rs.
+name = "make-tetra3rs-db"
+path = "src/bin/make_tetra3rs_db.rs"
+
 [features]
 # By default no hardware camera backend is compiled, so the server builds on
 # x86_64 and runs against the fake ImageCamera (see --test-image). Enable a
@@ -43,6 +47,7 @@ nix = { version = "0.28.0", features = ["time"] }
 pico-args = "0.5.0"
 prost = "0.12.3"
 prost-types = "0.12.3"
+tetra3 = { version = "0.9.0", path = "../../tetra3rs" }
 tetra3_server = { version = "0.1.0", path = "../../tetra3_server" }
 tokio = { version = "1.41.0", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"

@@ -6,6 +6,7 @@
 // camera -> detect -> solve path the box runs in flight.
 
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +22,8 @@ use cedar_server::solve_engine::{PlateSolution, SolveEngine};
 use image::GrayImage;
 use tokio::sync::Mutex;
 
-use super::corpus::Field;
+use super::corpus::{self, Field};
+use super::report::Report;
 
 // Production values, from server_main's MyCedar::new call (cedar_server.rs:4526)
 // and the pico-args defaults (cedar_server.rs:4029).
@@ -35,6 +37,32 @@ const STATS_CAPACITY: usize = 100;
 /// Upper bound on solutions consumed while waiting for a swapped-in image to
 /// reach the solver. Generous: in practice it settles within a few.
 const MAX_SETTLE_RESULTS: usize = 32;
+
+/// Production's detect binning for a sensor of `width` x `height`, mirroring
+/// `MyCedar::compute_binning` (cedar_server.rs:2050), which the server calls on
+/// every camera change (cedar_server.rs:969, :3617).
+///
+/// Binning is derived from sensor megapixels, NOT from `--binning`, which only
+/// overrides it. A 1920x1080 frame is 2.07 mpix, so **production detects at
+/// binning 2**, and the harness must too: at binning 1 a faint real star's peak
+/// stays under the noise floor, while summing 2x2 lifts it over the sigma
+/// threshold. On synthetic images this hardly matters -- the stars are clean and
+/// bright either way -- which is how the harness ran at binning 1 for so long
+/// without anyone noticing.
+///
+/// Returns `(detect_binning, display_sampling)`.
+pub fn production_binning(width: u32, height: u32) -> (u32, bool) {
+    let mpix = (width * height) as f64 / 1_000_000.0;
+    if mpix <= 0.75 {
+        (1, false)
+    } else if mpix <= 3.0 {
+        (2, false)
+    } else if mpix <= 12.0 {
+        (4, false)
+    } else {
+        (4, true)
+    }
+}
 
 // Gates. Center/roll/FOV mirror cedar-solve/tests/test_solve_e2e.py:30-33.
 pub const CENTER_TOL_ARCMIN: f64 = 5.0;
@@ -61,6 +89,7 @@ pub struct Stack {
 
 impl Stack {
     pub async fn new(solver: SharedSolver, seed_image: GrayImage) -> Stack {
+        let (width, height) = seed_image.dimensions();
         let camera = wrap_camera(
             ImageCamera::new(seed_image)
                 .await
@@ -83,10 +112,19 @@ impl Stack {
         // the run deterministic and stops the worker from hunting.
         detect.lock().await.set_autoexposure_enabled(false).await;
 
-        // Note: detect_binning is left at its default of 1, so CedarDetect runs
-        // on the full-resolution frame. That matches cedar-box-server, which
-        // passes default_total_binning=None (cedar_server.rs:4445) -- the binned
-        // buffer is only used when detect_binning != 1 (detect_engine.rs:640).
+        // DetectEngine defaults detect_binning to 1 (detect_engine.rs:135); the
+        // server overrides it from sensor size before the first frame. Do the
+        // same, or CedarDetect runs on the full-resolution frame and finds a
+        // different set of stars than the box does. `detect_binning` lives in
+        // DetectEngine state, not the camera, so this survives replace_camera.
+        // Centroids come back in full-res coordinates regardless of binning
+        // (cedar-detect/src/algorithm.rs:766), so nothing downstream changes.
+        let (detect_binning, display_sampling) = production_binning(width, height);
+        detect
+            .lock()
+            .await
+            .set_detect_binning(detect_binning, display_sampling)
+            .await;
 
         let pre_solve: Arc<
             dyn Fn() -> Pin<
@@ -167,6 +205,25 @@ impl Stack {
     }
 }
 
+/// Drives every field of the corpus through one already-built stack.
+///
+/// Takes `&mut Stack` rather than a solver because the stack must be reusable
+/// afterwards (for the blank-frame control) and because `Tetra3Solver` may not
+/// be constructed twice -- it binds the hardcoded `/tmp/cedar.sock`.
+pub async fn run_corpus(
+    stack: &mut Stack,
+    data_dir: &Path,
+    fields: &[Field],
+    solver_name: &str,
+) -> Report {
+    let mut outcomes = Vec::with_capacity(fields.len());
+    for field in fields {
+        let image = corpus::load_image(data_dir, field).expect("load png");
+        outcomes.push(evaluate(field, &stack.solve_image(image).await));
+    }
+    Report::new(solver_name, outcomes)
+}
+
 /// Per-field measurement. Errors are recorded whether or not they pass, so the
 /// report can show near-misses.
 #[derive(Debug, Clone)]
@@ -191,7 +248,7 @@ impl Outcome {
 }
 
 /// Smallest signed difference between two angles, in [-180, 180].
-fn circular_diff_deg(a: f64, b: f64) -> f64 {
+pub fn circular_diff_deg(a: f64, b: f64) -> f64 {
     (a - b + 180.0).rem_euclid(360.0) - 180.0
 }
 
@@ -334,5 +391,21 @@ mod tests {
     #[test]
     fn roll_error_beyond_tolerance_fails() {
         assert!(!outcome(0.04, 1.5, 0.004).passed());
+    }
+
+    /// The corpus resolution both suites run at. 2.07 mpix lands in the 2x bucket,
+    /// so the harness must detect at binning 2 -- the earlier claim that
+    /// production runs full-res (docs/03 finding #2) skipped compute_binning.
+    #[test]
+    fn corpus_resolution_bins_by_two() {
+        assert_eq!(production_binning(1920, 1080), (2, false));
+    }
+
+    #[test]
+    fn binning_buckets_follow_compute_binning() {
+        assert_eq!(production_binning(640, 480), (1, false)); // 0.31 mpix
+        assert_eq!(production_binning(1024, 768), (2, false)); // 0.79 mpix
+        assert_eq!(production_binning(2028, 1520), (4, false)); // 3.08 mpix
+        assert_eq!(production_binning(4056, 3040), (4, true)); // 12.3 mpix
     }
 }

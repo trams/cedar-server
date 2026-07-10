@@ -134,13 +134,13 @@ fn env_path(var: &str, default: PathBuf) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or(default)
 }
 
-pub fn preconditions() -> Preconditions {
-    let root = repo_root();
-
+/// The staged corpus directory, or why it cannot be found. Split out of
+/// `preconditions` because the tetra3rs solver needs the corpus but not Python.
+pub fn data_dir() -> Result<PathBuf, String> {
     let data_dir = match std::env::var_os("CEDAR_E2E_DATA_DIR") {
         Some(d) => PathBuf::from(d),
         None => {
-            return Preconditions::Skip(
+            return Err(
                 "CEDAR_E2E_DATA_DIR is not set. Stage the corpus with:\n  \
                  cd cedar-solve && source .cedar_venv/bin/activate && \
                  python tools/fetch_corpus.py\n  \
@@ -150,12 +150,84 @@ pub fn preconditions() -> Preconditions {
         }
     };
     if !data_dir.join("manifest.csv").is_file() {
-        return Preconditions::Skip(format!(
+        return Err(format!(
             "no manifest.csv under CEDAR_E2E_DATA_DIR ({}). Run \
              cedar-solve/tools/fetch_corpus.py.",
             data_dir.display()
         ));
     }
+    Ok(data_dir)
+}
+
+/// Path to a tetra3rs pattern database, generating and caching one under
+/// `target/` on first use.
+///
+/// Generation reads the 17 MB Gaia catalog and takes a couple of seconds in a
+/// release build (much longer in debug, which is one more reason this suite is
+/// documented as `cargo test --release`). Override the whole thing with
+/// `CEDAR_E2E_TETRA3RS_DB` to point at a database built by `make-tetra3rs-db`.
+///
+/// The 10-30 deg range is what the box would ship: `docs/04-fov-seed-sensitivity.md`
+/// found the multiscale database beats a single-scale one at *every* FOV seed,
+/// so narrowing it to the camera's exact FOV would be a pessimization.
+pub fn tetra3rs_database() -> Result<PathBuf, String> {
+    if let Some(p) = std::env::var_os("CEDAR_E2E_TETRA3RS_DB") {
+        let p = PathBuf::from(p);
+        if !p.is_file() {
+            return Err(format!("CEDAR_E2E_TETRA3RS_DB={} is not a file", p.display()));
+        }
+        return Ok(p);
+    }
+
+    let cached = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/e2e-cache/tetra3rs_10_30.bin");
+    if cached.is_file() {
+        return Ok(cached);
+    }
+
+    let gaia = env_path(
+        "CEDAR_E2E_GAIA_CATALOG",
+        repo_root().join("tetra3rs/data/gaia_merged.bin"),
+    );
+    if !gaia.is_file() {
+        return Err(format!(
+            "no tetra3rs database cached at {} and no Gaia catalog at {}.\n  \
+             Fetch the catalog (17 MB):\n    curl -o {} \
+             https://storage.googleapis.com/tetra3rs-testvecs/gaia_merged.bin\n  \
+             or point CEDAR_E2E_TETRA3RS_DB at a database built by make-tetra3rs-db.",
+            cached.display(),
+            gaia.display(),
+            gaia.display()
+        ));
+    }
+
+    let parent = cached.parent().expect("cached db has a parent");
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+
+    eprintln!(
+        "generating tetra3rs database from {} (one-time, cached at {})",
+        gaia.display(),
+        cached.display()
+    );
+    let db = cedar_server::tetra3rs_solver::generate_database(
+        gaia.to_str().ok_or("non-utf8 Gaia path")?,
+        10.0,
+        30.0,
+    )
+    .map_err(|e| format!("generating tetra3rs database: {e:?}"))?;
+    db.save_to_file(cached.to_str().ok_or("non-utf8 cache path")?)
+        .map_err(|e| format!("writing {}: {e:?}", cached.display()))?;
+    Ok(cached)
+}
+
+pub fn preconditions() -> Preconditions {
+    let root = repo_root();
+
+    let data_dir = match data_dir() {
+        Ok(d) => d,
+        Err(why) => return Preconditions::Skip(why),
+    };
 
     // Tetra3Solver spawns a bare `python`, inheriting PATH. If the cedar-solve
     // venv is not active, the subprocess dies a second after launch and the

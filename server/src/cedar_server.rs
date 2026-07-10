@@ -66,6 +66,7 @@ use nix::{
 };
 use pico_args::Arguments;
 use prost::Message;
+use crate::tetra3rs_solver::Tetra3RsSolver;
 use tetra3_server::tetra3_solver::Tetra3Solver;
 use tonic::transport::server::Routes;
 use tonic_web::{GrpcWebLayer, GrpcWebService};
@@ -4074,8 +4075,17 @@ impl MyCedar {
 
 #[derive(Debug)]
 struct AppArgs {
+    /// Which plate solver to run: "tetra3" (Python subprocess) or "tetra3rs"
+    /// (pure Rust, in-process).
+    solver: String,
     tetra3_script: String,
     tetra3_database: String,
+    /// Pattern database for --solver tetra3rs, built by `make-tetra3rs-db`.
+    tetra3rs_database: String,
+    /// The camera's horizontal FOV in degrees, seeding tetra3rs's search.
+    /// A loose hint, not a measurement: anything within roughly +/-50% of the
+    /// true FOV solves (docs/04-fov-seed-sensitivity.md). Omit to solve blind.
+    tetra3rs_fov: Option<f64>,
     camera_interface: String,
     camera_index: usize,
     binning: Option<u32>,
@@ -4096,6 +4106,24 @@ fn parse_duration(
 ) -> Result<std::time::Duration, std::num::ParseFloatError> {
     let seconds = arg.parse()?;
     Ok(std::time::Duration::from_secs_f64(seconds))
+}
+
+/// A command line flag, falling back to an environment variable.
+///
+/// The flag wins, so a systemd unit can set a default in the environment while
+/// an operator overrides it on the command line.
+fn arg_or_env(
+    pargs: &mut Arguments,
+    flag: &'static str,
+    env_var: &str,
+) -> Option<String> {
+    pargs
+        .opt_value_from_str::<_, String>(flag)
+        .unwrap_or_else(|e| {
+            eprintln!("{flag}: {e}");
+            std::process::exit(1);
+        })
+        .or_else(|| std::env::var(env_var).ok())
 }
 
 // `get_dependencies` Is called to obtain the CedarSkyTrait, WifiTrait,
@@ -4124,8 +4152,12 @@ pub fn server_main(
       -h, --help                     Prints help information
 
     OPTIONS:
+      --solver tetra3|tetra3rs       tetra3          [env: CEDAR_SOLVER]
       --tetra3_script <path>         ../cedar/tetra3_server/python/tetra3_server.py
       --tetra3_database <name>       default_database
+      --tetra3rs_database <path>     ./tetra3rs_db.bin  [env: CEDAR_TETRA3RS_DATABASE]
+      --tetra3rs_fov <deg>           camera horizontal FOV, a loose hint; blind if
+                                     unset  [env: CEDAR_TETRA3RS_FOV]
       --camera_interface asi|rpi
       --camera_index NUMBER
       --binning 1|2|4|8
@@ -4146,12 +4178,27 @@ pub fn server_main(
         std::process::exit(0);
     }
     let args = AppArgs {
+        solver: arg_or_env(&mut pargs, "--solver", "CEDAR_SOLVER")
+            .unwrap_or("tetra3".to_string()),
         tetra3_script: pargs.value_from_str("--tetra3_script").unwrap_or(
             "../cedar/tetra3_server/python/tetra3_server.py".to_string(),
         ),
         tetra3_database: pargs
             .value_from_str("--tetra3_database")
             .unwrap_or("default_database".to_string()),
+        tetra3rs_database: arg_or_env(
+            &mut pargs,
+            "--tetra3rs_database",
+            "CEDAR_TETRA3RS_DATABASE",
+        )
+        .unwrap_or("./tetra3rs_db.bin".to_string()),
+        tetra3rs_fov: arg_or_env(&mut pargs, "--tetra3rs_fov", "CEDAR_TETRA3RS_FOV")
+            .map(|s| {
+                s.parse::<f64>().unwrap_or_else(|e| {
+                    eprintln!("--tetra3rs_fov: {s:?} is not a number: {e}");
+                    std::process::exit(1);
+                })
+            }),
         camera_interface: pargs
             .value_from_str("--camera_interface")
             .unwrap_or("".to_string()),
@@ -4711,6 +4758,17 @@ async fn async_main(
         imu.lock().await.start();
     }
 
+    // Fail on a bad --solver before opening the camera, not after.
+    if injected_solver.is_none()
+        && !matches!(args.solver.as_str(), "tetra3" | "tetra3rs")
+    {
+        error!(
+            "Unrecognized 'solver' value {:?}; expected tetra3 or tetra3rs",
+            args.solver
+        );
+        std::process::exit(1);
+    }
+
     let camera_interface = match args.camera_interface.as_str() {
         "" => None,
         "asi" => Some(CameraInterface::ASI),
@@ -4828,19 +4886,43 @@ async fn async_main(
     let activity_led =
         Arc::new(tokio::sync::Mutex::new(ActivityLed::new(got_signal.clone())));
 
-    // Use supplied solver, with Tetra3Solver as fallback.
-    let solver = match injected_solver {
-        Some(s) => s,
-        None => Arc::new(tokio::sync::Mutex::new(
-            Tetra3Solver::new(
-                &args.tetra3_script,
-                &args.tetra3_database,
-                got_signal.clone(),
-            )
-            .await
-            .unwrap(),
-        )),
-    };
+    // Use supplied solver, else the one named by --solver.
+    let solver: Arc<tokio::sync::Mutex<dyn SolverTrait + Send + Sync>> =
+        match injected_solver {
+            Some(s) => s,
+            None => match args.solver.as_str() {
+                "tetra3" => Arc::new(tokio::sync::Mutex::new(
+                    Tetra3Solver::new(
+                        &args.tetra3_script,
+                        &args.tetra3_database,
+                        got_signal.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                )),
+                "tetra3rs" => {
+                    // Loading is a few hundred ms for a 30 MB database; do it
+                    // before the gRPC service comes up, and fail loudly.
+                    match Tetra3RsSolver::from_database_file(
+                        &args.tetra3rs_database,
+                        args.tetra3rs_fov,
+                    ) {
+                        Ok(s) => Arc::new(tokio::sync::Mutex::new(s)),
+                        Err(e) => {
+                            error!("Could not load tetra3rs database: {:?}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                other => {
+                    error!(
+                        "Unrecognized 'solver' value {:?}; expected tetra3 or tetra3rs",
+                        other
+                    );
+                    std::process::exit(1);
+                }
+            },
+        };
 
     // Build the gRPC service.
     let path: PathBuf = [args.log_dir, args.log_file].iter().collect();

@@ -32,8 +32,8 @@ mod common;
 
 use common::corpus::{self, Env, Field, Preconditions};
 use common::fake_solver::FakeSolver;
-use common::harness::{evaluate, expected_roll_deg, Stack};
-use common::report::{print_table, Report, SOLVE_P95_TARGET_MS};
+use common::harness::{evaluate, expected_roll_deg, run_corpus, Stack};
+use common::report::{print_table, Report};
 
 type SharedSolver = Arc<Mutex<dyn SolverTrait + Send + Sync>>;
 
@@ -158,17 +158,11 @@ async fn e2e_corpus() {
     println!("\nRunning {} fields from {}", fields.len(), env.data_dir.display());
 
     // ---- Real solver over the whole corpus -------------------------------
-    let solver = tetra3_solver(&env).await;
+    // One Tetra3Solver, one stack: a second Tetra3Solver would collide on the
+    // hardcoded /tmp/cedar.sock.
     let seed = corpus::load_image(&env.data_dir, &fields[0]).expect("load png");
-    let mut stack = Stack::new(solver, seed).await;
-
-    let mut outcomes = Vec::with_capacity(fields.len());
-    for field in &fields {
-        let image = corpus::load_image(&env.data_dir, field).expect("load png");
-        let ps = stack.solve_image(image).await;
-        outcomes.push(evaluate(field, &ps));
-    }
-    let tetra3_report = Report::new("tetra3", outcomes);
+    let mut stack = Stack::new(tetra3_solver(&env).await, seed).await;
+    let tetra3_report = run_corpus(&mut stack, &env.data_dir, &fields, "tetra3").await;
 
     // ---- Negative control B: a blank frame must not produce a pose --------
     // Fewer than MINIMUM_STARS (4) centroids, so solve_engine never even calls
@@ -200,20 +194,7 @@ async fn e2e_corpus() {
         Err(e) => eprintln!("could not write CSV: {e}"),
     }
 
-    for o in tetra3_report.failures() {
-        eprintln!(
-            "FAIL {}: solved={} center={:.3}' roll_err={:.3} fov_err={:.3}% \
-             centroids={} matches={} {:.1} ms",
-            o.name,
-            o.solved,
-            o.center_arcmin,
-            o.roll_err_deg,
-            o.fov_err_frac * 100.0,
-            o.num_centroids,
-            o.num_matches,
-            o.solve_time_ms
-        );
-    }
+    tetra3_report.print_failures();
 
     // ---- Gates ------------------------------------------------------------
     assert!(
@@ -227,28 +208,7 @@ async fn e2e_corpus() {
          firing: {wrong_outcome:?}"
     );
 
-    let s = tetra3_report.summary();
-    let solve_rate = s.solved as f64 / s.total as f64;
-    assert!(
-        solve_rate >= MIN_SOLVE_RATE,
-        "solve rate {:.3} below {:.3} ({}/{} fields solved)",
-        solve_rate,
-        MIN_SOLVE_RATE,
-        s.solved,
-        s.total
-    );
-    assert_eq!(
-        s.passed, s.total,
-        "{} of {} fields missed the pose gates",
-        s.total - s.passed,
-        s.total
-    );
-    assert!(
-        s.solve_p95_ms < SOLVE_P95_TARGET_MS,
-        "solve_time p95 {:.1} ms exceeds the {:.0} ms target",
-        s.solve_p95_ms,
-        SOLVE_P95_TARGET_MS
-    );
+    tetra3_report.assert_gates(MIN_SOLVE_RATE);
 
     // Keep the fake stacks alive until here so their workers are not dropped
     // mid-assert.

@@ -31,7 +31,9 @@ impl FakeSolver {
             ra: field.ra_deg,
             dec: field.dec_deg,
             roll: expected_roll_deg(field.rotation_deg),
-            fov: field.fov_x_deg,
+            // The gnomonic FOV, which is what a correct solver reports -- not
+            // the manifest's small-angle fov_x_deg. See Field::true_fov_x_deg.
+            fov: field.true_fov_x_deg(),
         }
     }
 

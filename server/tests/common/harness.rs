@@ -234,7 +234,10 @@ pub fn evaluate(field: &Field, ps: &PlateSolution) -> Outcome {
         * 60.0;
 
     let roll_err_deg = circular_diff_deg(p.roll, expected_roll_deg(field.rotation_deg));
-    let fov_err_frac = (p.fov - field.fov_x_deg).abs() / field.fov_x_deg;
+    // Against the gnomonic FOV, not the manifest's small-angle fov_x_deg -- see
+    // Field::true_fov_x_deg.
+    let true_fov = field.true_fov_x_deg();
+    let fov_err_frac = (p.fov - true_fov).abs() / true_fov;
 
     let solve_time_ms = p
         .solve_time

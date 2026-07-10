@@ -105,6 +105,84 @@ impl Report {
     pub fn failures(&self) -> Vec<&Outcome> {
         self.outcomes.iter().filter(|o| !o.passed()).collect()
     }
+
+    /// Prints every field that missed a gate. Call before asserting, so a
+    /// failing run prints its evidence rather than just a count.
+    pub fn print_failures(&self) {
+        for o in self.failures() {
+            eprintln!(
+                "FAIL {}: solved={} center={:.3}' roll_err={:.3} fov_err={:.3}% \
+                 centroids={} matches={} {:.1} ms",
+                o.name,
+                o.solved,
+                o.center_arcmin,
+                o.roll_err_deg,
+                o.fov_err_frac * 100.0,
+                o.num_centroids,
+                o.num_matches,
+                o.solve_time_ms
+            );
+        }
+    }
+
+    pub fn assert_solve_rate(&self, min_solve_rate: f64) {
+        let s = self.summary();
+        let solve_rate = s.solved as f64 / s.total as f64;
+        assert!(
+            solve_rate >= min_solve_rate,
+            "{}: solve rate {:.3} below {:.3} ({}/{} fields solved)",
+            self.solver,
+            solve_rate,
+            min_solve_rate,
+            s.solved,
+            s.total
+        );
+    }
+
+    /// No frame that solved may be wrong. Distinct from `assert_solve_rate`:
+    /// declining to solve is a capability limit, reporting a bad pose is a bug,
+    /// and a corpus may tolerate the first while never tolerating the second.
+    pub fn assert_solved_frames_agree(&self) {
+        let wrong: Vec<&Outcome> = self
+            .outcomes
+            .iter()
+            .filter(|o| o.solved && !o.passed())
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{}: {} frame(s) solved to a pose outside the gates: {:?}",
+            self.solver,
+            wrong.len(),
+            wrong.iter().map(|o| &o.name).collect::<Vec<_>>()
+        );
+    }
+
+    pub fn assert_latency(&self) {
+        let s = self.summary();
+        assert!(
+            s.solve_p95_ms < SOLVE_P95_TARGET_MS,
+            "{}: solve_time p95 {:.1} ms exceeds the {:.0} ms target",
+            self.solver,
+            s.solve_p95_ms,
+            SOLVE_P95_TARGET_MS
+        );
+    }
+
+    /// The corpus-wide gates: every field solves, every field passes its pose
+    /// gates, and `solve_time` p95 stays under target.
+    pub fn assert_gates(&self, min_solve_rate: f64) {
+        self.assert_solve_rate(min_solve_rate);
+        let s = self.summary();
+        assert_eq!(
+            s.passed,
+            s.total,
+            "{}: {} of {} fields missed the pose gates",
+            self.solver,
+            s.total - s.passed,
+            s.total
+        );
+        self.assert_latency();
+    }
 }
 
 /// One row per solver, so two solvers can be read side by side.

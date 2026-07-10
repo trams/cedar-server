@@ -13,3 +13,4 @@ pub mod position_reporter;
 pub mod rate_estimator;
 pub mod serve_engine;
 pub mod solve_engine;
+pub mod tetra3rs_solver;

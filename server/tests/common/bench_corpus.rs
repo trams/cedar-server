@@ -1,5 +1,5 @@
-// Loading the *real* benchmark corpus: frames captured off a Cedar box's camera
-// by `CEDAR_BENCH_DIR` capture (see docs/enabling-benchmark-capture.md).
+// Loading the *real* captured corpus: frames recorded off a Cedar box's camera,
+// with a manifest of what the box's own tetra3 reported for each frame.
 //
 // This corpus differs from the synthetic one in a way that changes what a test
 // over it can claim. The synthetic manifest carries the pose the image was
@@ -8,9 +8,9 @@
 // not correctness. A bias both solvers share is invisible here; a bias either one
 // has alone shows up as disagreement, without saying which is at fault.
 //
-// What makes the comparison sound is that `write_bench_frame` (solve_engine.rs:181)
-// records `p.roll` and `p.fov` straight off the same `PlateSolution` proto that
-// `SolveEngine::get_next_result` hands this harness, and saves
+// What makes the comparison sound is how the corpus was recorded: `roll` and
+// `fov` come straight off the same `PlateSolution` proto that
+// `SolveEngine::get_next_result` hands this harness, saved next to
 // `detect_result.captured_image` -- the full-resolution frame DetectEngine
 // consumed. Same image in, same proto fields out, no reprojection in between.
 
@@ -46,17 +46,19 @@ pub struct BenchFrame {
 }
 
 impl BenchFrame {
-    /// Filename without the `.bmp`, for report rows and CSV keys.
+    /// Filename without its image extension, for report rows and CSV keys.
+    /// Handles both `.png` (current) and `.bmp` (legacy corpora).
     pub fn name(&self) -> String {
         self.filename
-            .strip_suffix(".bmp")
+            .strip_suffix(".png")
+            .or_else(|| self.filename.strip_suffix(".bmp"))
             .unwrap_or(&self.filename)
             .to_string()
     }
 }
 
-/// The exact header `write_bench_frame` (solve_engine.rs:169) emits. Parsing is
-/// positional, so header drift must be a hard error, not a silent column shift.
+/// The exact header the corpus manifest uses. Parsing is positional, so header
+/// drift must be a hard error, not a silent column shift.
 const BENCH_HEADER: &str = "filename,frame_id,solution_id,exposure_ms,width,height,solved,\
                             from_imu,ra_deg,dec_deg,roll_deg,fov_deg,rmse_arcsec,num_matches,\
                             solve_ms,readout_time_iso";
@@ -87,7 +89,7 @@ pub fn parse_bench_manifest(text: &str) -> Result<Vec<BenchFrame>, String> {
                 .map_err(|e| format!("bench manifest.csv row {} col {}: {e}", n + 2, i))
         };
 
-        // IMU interpolations are not fresh camera solves. write_bench_frame skips
+        // IMU interpolations are not fresh camera solves. The capture skips
         // them, so this is a defensive drop rather than an expected path.
         if row[7] == "true" {
             continue;
@@ -128,8 +130,7 @@ pub fn parse_bench_manifest(text: &str) -> Result<Vec<BenchFrame>, String> {
 /// The captured-frame corpus directory, or why it cannot be found.
 ///
 /// Defaults to `<repo_root>/benchmarks/take1`, the corpus pulled off the Pi;
-/// `CEDAR_E2E_BENCH_DIR` overrides. Not to be confused with `CEDAR_BENCH_DIR`,
-/// which makes a *running server* write a corpus and must stay unset here.
+/// `CEDAR_E2E_BENCH_DIR` overrides.
 pub fn bench_dir() -> Result<PathBuf, String> {
     let dir = match std::env::var_os("CEDAR_E2E_BENCH_DIR") {
         Some(d) => PathBuf::from(d),
@@ -141,8 +142,8 @@ pub fn bench_dir() -> Result<PathBuf, String> {
     };
     if !dir.join("manifest.csv").is_file() {
         return Err(format!(
-            "no manifest.csv under {} -- point CEDAR_E2E_BENCH_DIR at a corpus \
-             captured per docs/enabling-benchmark-capture.md",
+            "no manifest.csv under {} -- point CEDAR_E2E_BENCH_DIR at a \
+             captured corpus directory",
             dir.display()
         ));
     }

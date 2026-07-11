@@ -46,10 +46,12 @@ pub struct BenchFrame {
 }
 
 impl BenchFrame {
-    /// Filename without the `.bmp`, for report rows and CSV keys.
+    /// Filename without its image extension, for report rows and CSV keys.
+    /// Handles both `.png` (current) and `.bmp` (legacy corpora).
     pub fn name(&self) -> String {
         self.filename
-            .strip_suffix(".bmp")
+            .strip_suffix(".png")
+            .or_else(|| self.filename.strip_suffix(".bmp"))
             .unwrap_or(&self.filename)
             .to_string()
     }

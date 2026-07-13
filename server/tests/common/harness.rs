@@ -18,6 +18,7 @@ use cedar_elements::cedar::{ImageCoord, LatLong, PlateSolution as PlateSolutionP
 use cedar_elements::cedar_common::CelestialCoord;
 use cedar_elements::solver_trait::SolverTrait;
 use cedar_server::detect_engine::{DetectEngine, DetectResult};
+use cedar_server::observation_log::ObservationLog;
 use cedar_server::solve_engine::{PlateSolution, SolveEngine};
 use image::GrayImage;
 use tokio::sync::Mutex;
@@ -153,6 +154,7 @@ impl Stack {
             pre_solve,
             post_solve,
             /*observer_location=*/ None,
+            /*observation_log=*/ Arc::new(ObservationLog::disabled()),
         )
         .expect("SolveEngine::new");
 

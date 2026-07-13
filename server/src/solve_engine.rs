@@ -41,6 +41,7 @@ use imageproc::rect::Rect;
 use log::{debug, info, warn};
 
 use crate::detect_engine::{DetectEngine, DetectResult};
+use crate::observation_log::ObservationLog;
 
 const IMU_INTERPOLATION_INTERVAL: Duration = Duration::from_millis(100);
 const MINIMUM_STARS: usize = 4;
@@ -389,6 +390,15 @@ fn maybe_capture_bench_frame(state: &mut SolveState) {
         }
     }
 }
+// Observation-log hook: record the just-stored PlateSolution. The
+// ObservationLog decides internally whether to write (enabled? IMU? throttle?),
+// so this is a cheap unconditional call. Never fails the solve loop.
+fn maybe_log_observation(state: &SolveState) {
+    if let Some(ps) = state.plate_solution.as_ref() {
+        state.observation_log.log_solve(ps);
+    }
+}
+
 // Minimum angular velocity (degrees/sec) below which we suppress IMU
 // interpolation when the scope is at rest.
 const IMU_MOTION_THRESHOLD_DEG_PER_SEC: f64 = 0.5;
@@ -508,6 +518,11 @@ struct SolveState {
     bench_unsolved_count: u32,
     bench_seq: u64,
     bench_done_logged: bool,
+
+    // Observation log: records each real plate solve (throttled) to a local
+    // JSON Lines file. Shared with the gRPC handler, which logs GoTo requests
+    // to the same file. Always present; a no-op when disabled.
+    observation_log: Arc<ObservationLog>,
 }
 
 impl SolveEngine {
@@ -521,6 +536,7 @@ impl SolveEngine {
         pre_solve_callback: PreSolveCallback,
         post_solve_callback: PostSolveCallback,
         observer_location: Option<LatLong>,
+        observation_log: Arc<ObservationLog>,
     ) -> Result<Self, CanonicalError> {
         Ok(SolveEngine {
             solver,
@@ -561,6 +577,7 @@ impl SolveEngine {
                 bench_unsolved_count: 0,
                 bench_seq: 0,
                 bench_done_logged: false,
+                observation_log,
             })),
             detect_engine,
             hot_pixel_map,
@@ -1533,6 +1550,11 @@ impl SolveEngine {
         // set. Runs here because the just-stored PlateSolution bundles the frame
         // image and its ground-truth solution together.
         maybe_capture_bench_frame(&mut locked_state);
+
+        // Observation log: record this solve (skips IMU interpolations and
+        // applies its own throttle). Same rationale as the bench sampler — the
+        // just-stored PlateSolution has the frame and solution paired.
+        maybe_log_observation(&locked_state);
     }
 
     async fn worker(

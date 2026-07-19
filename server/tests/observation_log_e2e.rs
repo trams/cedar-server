@@ -24,6 +24,7 @@ use cedar_elements::imu_trait::EquatorialCoordinates;
 use cedar_elements::solver_trait::{SolveExtension, SolveParams, SolverTrait};
 use cedar_server::detect_engine::{DetectEngine, DetectResult};
 use cedar_server::observation_log::ObservationLog;
+use cedar_server::position_reporter::TelescopePosition;
 use cedar_server::solve_engine::SolveEngine;
 use tokio::sync::Mutex;
 
@@ -209,15 +210,14 @@ async fn observation_log_records_solves() {
         "no solved record was logged; detection may have found <4 stars in the demo image"
     );
 
-    // GoTo path (what MyCedar::initiate_action does): the strong-intent events
-    // land in the same file, unthrottled.
-    let target = CelestialCoord {
-        ra: 101.287,
-        dec: -16.716,
-        epoch: None,
-    };
-    goto_log.log_goto("initiate_slew", Some(&target));
-    goto_log.log_goto("stop_slew", None);
+    // GoTo path: the strong-intent events land in the same file, unthrottled.
+    // Drive the TelescopePosition seam rather than log_goto() directly — that
+    // seam is what every protocol (gRPC, LX200, Alpaca) funnels through, so
+    // this exercises the same code MyCedar::initiate_action does. The LX200
+    // command level has its own test in lx200_server.rs.
+    let mut telescope_position = TelescopePosition::new(goto_log.clone());
+    telescope_position.set_slew_target(101.287, -16.716, "grpc");
+    telescope_position.clear_slew("grpc");
 
     let goto_lines: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
         .unwrap()
@@ -230,6 +230,7 @@ async fn observation_log_records_solves() {
 
     let initiate = &goto_lines[0];
     assert_eq!(initiate["action"], "initiate_slew");
+    assert_eq!(initiate["source"], "grpc");
     assert!((initiate["ra_deg"].as_f64().unwrap() - 101.287).abs() < 1e-6);
     assert!((initiate["dec_deg"].as_f64().unwrap() - (-16.716)).abs() < 1e-6);
     assert!(initiate["time"].is_string());

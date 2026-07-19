@@ -9,7 +9,11 @@
 //!   pointing coordinates), throttled to bound file size. IMU-interpolated
 //!   results are skipped; they are not fresh observations.
 //! * `"goto"` — one record per GoTo request (`initiate_slew` / `stop_slew`),
-//!   the strong user-intent signal. Never throttled.
+//!   the strong user-intent signal. Never throttled. GoTos reach Cedar over
+//!   three different protocols (gRPC from Cedar-aim, LX200 and Alpaca from
+//!   SkySafari and friends); rather than instrument each one, the logging hook
+//!   lives on the state they all mutate — see `TelescopePosition` in
+//!   `position_reporter.rs` — and each record names its `source`.
 //!
 //! This is deliberately modeled on the benchmark-corpus capture in
 //! `solve_engine.rs` (`BenchConfig`, `write_bench_frame`): config from the
@@ -104,13 +108,17 @@ struct SolveRecord {
 }
 
 // A logged GoTo request. `action` is "initiate_slew" or "stop_slew"; the target
-// coordinates are present only for initiate_slew.
+// coordinates are present only for initiate_slew. `source` names the protocol
+// the request arrived on ("grpc", "lx200", "alpaca", "mode_change") — a session
+// driven from SkySafari looks entirely different from one driven from the
+// Cedar-aim UI, and the analysis wants to tell them apart.
 #[derive(Serialize)]
 struct GotoRecord {
     #[serde(rename = "type")]
     kind: &'static str,
     time: String,
     action: String,
+    source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ra_deg: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,12 +126,23 @@ struct GotoRecord {
 }
 
 /// Append-only observation log, shared as an `Arc` between the solve engine
-/// (solve records) and the gRPC handler (GoTo records). Each write opens the
-/// file in append mode, so there is no long-lived handle to coordinate; the
+/// (solve records) and the `TelescopePosition` (GoTo records). Each write opens
+/// the file in append mode, so there is no long-lived handle to coordinate; the
 /// only shared mutable state is the solve-record throttle timestamp.
 pub struct ObservationLog {
     config: ObsLogConfig,
     last_solve_write: Mutex<Option<Instant>>,
+}
+
+// TelescopePosition holds an ObservationLog and derives Debug; the log's
+// interesting state is its config, so show that and skip the throttle mutex.
+impl std::fmt::Debug for ObservationLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObservationLog")
+            .field("enabled", &self.config.enabled)
+            .field("path", &self.config.path)
+            .finish()
+    }
 }
 
 impl ObservationLog {
@@ -140,6 +159,16 @@ impl ObservationLog {
         }
         ObservationLog {
             config,
+            last_solve_write: Mutex::new(None),
+        }
+    }
+
+    /// An enabled log writing to an explicit path, bypassing the environment.
+    /// For tests: `from_env()` reads process-global state, which races when
+    /// several tests in one binary each want their own log file.
+    pub fn for_path(path: PathBuf, throttle: Duration) -> ObservationLog {
+        ObservationLog {
+            config: ObsLogConfig { path, throttle, enabled: true },
             last_solve_write: Mutex::new(None),
         }
     }
@@ -229,8 +258,18 @@ impl ObservationLog {
     }
 
     /// Records a GoTo request. `action` is "initiate_slew" or "stop_slew";
-    /// `coord` carries the (J2000) target for initiate_slew, None otherwise.
-    pub fn log_goto(&self, action: &str, coord: Option<&CelestialCoord>) {
+    /// `source` is the originating protocol (see `GotoRecord::source`); `coord`
+    /// carries the (J2000) target for initiate_slew, None otherwise.
+    ///
+    /// Callers should not reach this directly: GoTos are logged by
+    /// `TelescopePosition::set_slew_target` / `clear_slew`, so that every
+    /// protocol that can start a slew is covered by construction.
+    pub fn log_goto(
+        &self,
+        action: &str,
+        source: &str,
+        coord: Option<&CelestialCoord>,
+    ) {
         if !self.config.enabled {
             return;
         }
@@ -238,6 +277,7 @@ impl ObservationLog {
             kind: "goto",
             time: iso_local(SystemTime::now()),
             action: action.to_string(),
+            source: source.to_string(),
             ra_deg: coord.map(|c| c.ra),
             dec_deg: coord.map(|c| c.dec),
         };
@@ -398,12 +438,14 @@ mod tests {
             kind: "goto",
             time: "2026-07-13T21:05:02-0700".to_string(),
             action: "initiate_slew".to_string(),
+            source: "lx200".to_string(),
             ra_deg: Some(101.287),
             dec_deg: Some(-16.716),
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""type":"goto""#));
         assert!(json.contains(r#""action":"initiate_slew""#));
+        assert!(json.contains(r#""source":"lx200""#));
         assert!(json.contains(r#""ra_deg":101.287"#));
 
         // stop_slew carries no coordinates.
@@ -411,11 +453,13 @@ mod tests {
             kind: "goto",
             time: "2026-07-13T21:06:00-0700".to_string(),
             action: "stop_slew".to_string(),
+            source: "grpc".to_string(),
             ra_deg: None,
             dec_deg: None,
         };
         let json = serde_json::to_string(&stop).unwrap();
         assert!(json.contains(r#""action":"stop_slew""#));
+        assert!(json.contains(r#""source":"grpc""#));
         assert!(!json.contains("ra_deg"));
     }
 }

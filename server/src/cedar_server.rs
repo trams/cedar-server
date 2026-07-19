@@ -270,10 +270,6 @@ struct CedarState {
     telescope_position: Arc<tokio::sync::Mutex<TelescopePosition>>,
     activity_led: Arc<tokio::sync::Mutex<ActivityLed>>,
 
-    // Observation log shared with the solve engine; this handler writes GoTo
-    // records to it. See observation_log.rs.
-    observation_log: Arc<ObservationLog>,
-
     // Not all builds of Cedar-server support Cedar-sky.
     cedar_sky: Option<Arc<tokio::sync::Mutex<dyn CedarSkyTrait + Send>>>,
 
@@ -599,7 +595,12 @@ impl Cedar for MyCedar {
                                 .await;
                         }
                     }
-                    telescope_position_arc.lock().await.slew_active = false;
+                    // Entering SETUP cancels any slew in flight. Logged (as
+                    // source "mode_change") only if one actually was.
+                    telescope_position_arc
+                        .lock()
+                        .await
+                        .clear_slew("mode_change");
                 } else if new_operating_mode == OperatingMode::Operate as i32 {
                     // Transition: SETUP -> OPERATE mode.
                     if focus_mode || daylight_mode {
@@ -1540,27 +1541,17 @@ impl Cedar for MyCedar {
                 ));
             }
             let slew_coord = celestial_coord_to_j2000(&slew_coord);
-            {
-                let mut telescope = telescope_position_arc.lock().await;
-                telescope.slew_target_ra = slew_coord.ra;
-                telescope.slew_target_dec = slew_coord.dec;
-                telescope.slew_active = true;
-            }
-            // Observation log: GoTo is the strong user-intent signal. Log the
-            // J2000 target we just latched.
-            let observation_log = self.state.lock().await.observation_log.clone();
-            observation_log.log_goto("initiate_slew", Some(&slew_coord));
+            // set_slew_target() writes the observation log's GoTo record.
+            telescope_position_arc.lock().await.set_slew_target(
+                slew_coord.ra,
+                slew_coord.dec,
+                "grpc",
+            );
         }
         if req.stop_slew.unwrap_or(false) {
-            let (telescope_position_arc, observation_log) = {
-                let locked_state = self.state.lock().await;
-                (
-                    locked_state.telescope_position.clone(),
-                    locked_state.observation_log.clone(),
-                )
-            };
-            telescope_position_arc.lock().await.slew_active = false;
-            observation_log.log_goto("stop_slew", None);
+            let telescope_position_arc =
+                self.state.lock().await.telescope_position.clone();
+            telescope_position_arc.lock().await.clear_slew("grpc");
         }
         if req.save_image.unwrap_or(false) {
             let solve_engine = self.state.lock().await.solve_engine.clone();
@@ -3533,12 +3524,9 @@ impl MyCedar {
                 let telescope_pos = pre_solve_closure_telescope_position.clone();
                 Box::pin(async move {
                     let mut locked_telescope_position = telescope_pos.lock().await;
-                    let slew_target = if locked_telescope_position.slew_active {
-                        Some(CelestialCoord {
-                            ra: locked_telescope_position.slew_target_ra,
-                            dec: locked_telescope_position.slew_target_dec,
-                            epoch: None,
-                        })
+                    let slew_target = if locked_telescope_position.slew_active() {
+                        let (ra, dec) = locked_telescope_position.slew_target();
+                        Some(CelestialCoord { ra, dec, epoch: None })
                     } else {
                         None
                     };
@@ -3598,9 +3586,10 @@ impl MyCedar {
         );
 
         // Observation log, shared between the solve engine (solve records) and
-        // this handler (GoTo records). Configured from the environment; a no-op
-        // when disabled. See observation_log.rs.
-        let observation_log = Arc::new(ObservationLog::from_env());
+        // the TelescopePosition (GoTo records, from whichever protocol asked).
+        // It is constructed with the TelescopePosition in main() and borrowed
+        // from it here, so there is exactly one instance writing the file.
+        let observation_log = telescope_position.lock().await.observation_log();
 
         let solve_engine = Arc::new(tokio::sync::Mutex::new(
             SolveEngine::new(
@@ -3692,7 +3681,6 @@ impl MyCedar {
                 wifi,
                 imu_tracker,
                 hot_pixel_map,
-                observation_log,
                 preferences: shared_preferences.clone(),
                 scaled_image: None,
                 scaled_image_binning_factor: 1,
@@ -4884,8 +4872,13 @@ async fn async_main(
         );
     }
 
-    let shared_telescope_position =
-        Arc::new(tokio::sync::Mutex::new(TelescopePosition::new()));
+    // Observation log (see observation_log.rs), configured from the
+    // environment. It lives on the TelescopePosition so that GoTos arriving on
+    // any of our three telescope protocols get recorded; MyCedar::new() borrows
+    // it back from there for the solve engine.
+    let shared_telescope_position = Arc::new(tokio::sync::Mutex::new(
+        TelescopePosition::new(Arc::new(ObservationLog::from_env())),
+    ));
 
     // Apparently when a client cancels a gRPC request (e.g. timeout), the
     // corresponding server-side tokio task is cancelled. Per

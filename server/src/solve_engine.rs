@@ -60,8 +60,14 @@ const MAX_HINT_AGE: Duration = Duration::from_secs(5);
 struct BenchConfig {
     // Directory that receives the saved BMP frames and manifest.csv.
     dir: PathBuf,
-    // Minimum wall-clock interval between saved frames.
+    // Minimum wall-clock interval between bursts (measured from the last frame
+    // of the previous burst).
     interval: Duration,
+    // Number of consecutive camera frames to save each time the interval
+    // elapses. 1 restores the original one-frame-per-interval sampling. Bursts
+    // exist so the corpus can be used to study live stacking: only frames taken
+    // back-to-back are close enough in time to stack into one image.
+    burst: u32,
     // Cap on the number of solved frames to save.
     max_solved: u32,
     // Cap on the number of unsolved frames to save. Small by default: this is
@@ -74,7 +80,8 @@ impl BenchConfig {
     // Reads CEDAR_BENCH_DIR (plus optional tuning vars) from the environment.
     // Returns None when CEDAR_BENCH_DIR is unset/empty, disabling capture.
     //   CEDAR_BENCH_DIR           output directory (enables capture)
-    //   CEDAR_BENCH_INTERVAL_SECS min seconds between saves (default 2.0)
+    //   CEDAR_BENCH_INTERVAL_SECS min seconds between bursts (default 2.0)
+    //   CEDAR_BENCH_BURST         consecutive frames per burst (default 3)
     //   CEDAR_BENCH_MAX_SOLVED    solved-frame cap (default 1000)
     //   CEDAR_BENCH_MAX_UNSOLVED  unsolved-frame cap (default 20)
     fn from_env() -> Option<BenchConfig> {
@@ -88,6 +95,13 @@ impl BenchConfig {
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|v| *v >= 0.0)
             .unwrap_or(2.0);
+        // A burst of 0 would disable capture by a confusing back door; clamp to
+        // 1, which is the pre-burst one-frame-per-interval behavior.
+        let burst = std::env::var("CEDAR_BENCH_BURST")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(3)
+            .max(1);
         let max_solved = std::env::var("CEDAR_BENCH_MAX_SOLVED")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -97,16 +111,55 @@ impl BenchConfig {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(20);
         info!(
-            "Benchmark capture enabled: dir={:?} interval={}s \
+            "Benchmark capture enabled: dir={:?} interval={}s burst={} \
              max_solved={} max_unsolved={}",
-            dir, interval_secs, max_solved, max_unsolved
+            dir, interval_secs, burst, max_solved, max_unsolved
         );
         Some(BenchConfig {
             dir,
             interval: Duration::from_secs_f64(interval_secs),
+            burst,
             max_solved,
             max_unsolved,
         })
+    }
+}
+
+// Tracks the burst in flight for the benchmark sampler. Split out of SolveState
+// so the index/id bookkeeping is testable without standing up a whole engine.
+#[derive(Default)]
+struct BurstTracker {
+    // Frames still owed to the burst in flight; 0 between bursts.
+    remaining: u32,
+    // Names the current burst in the manifest.
+    id: u64,
+}
+
+impl BurstTracker {
+    fn in_flight(&self) -> bool {
+        self.remaining > 0
+    }
+
+    // Claims the next slot, opening a new burst if none is in flight. Returns
+    // the (burst_id, index_within_burst) to record for this frame.
+    fn claim(&mut self, burst_len: u32) -> (u64, u32) {
+        if self.remaining == 0 {
+            self.remaining = burst_len;
+        }
+        (self.id, burst_len - self.remaining)
+    }
+
+    // Marks the claimed frame as written. Returns true when that frame
+    // completed the burst.
+    fn written(&mut self) -> bool {
+        self.remaining = self.remaining.saturating_sub(1);
+        self.remaining == 0
+    }
+
+    // Ends the burst (completed, capped out, or failed) and moves to a fresh id.
+    fn end(&mut self) {
+        self.remaining = 0;
+        self.id += 1;
     }
 }
 
@@ -116,6 +169,10 @@ impl BenchConfig {
 // case the ground-truth columns are left blank. Returns the written PNG path.
 // The `image` and `proto` come from the same PlateSolution, so image and ground
 // truth are always for the same frame (no cross-frame pairing race).
+//
+// `burst` is Some((burst_id, index_within_burst)) for sampler frames, letting a
+// consumer group the back-to-back frames that are candidates for stacking. It is
+// None for on-demand saves, which belong to no burst.
 #[allow(clippy::too_many_arguments)]
 fn write_bench_frame(
     dir: &Path,
@@ -127,6 +184,7 @@ fn write_bench_frame(
     readout_time: SystemTime,
     from_imu: bool,
     proto: Option<&PlateSolutionProto>,
+    burst: Option<(u64, u32)>,
 ) -> Result<PathBuf, CanonicalError> {
     std::fs::create_dir_all(dir).map_err(|e| {
         failed_precondition_error(&format!(
@@ -177,9 +235,11 @@ fn write_bench_frame(
     if need_header {
         writeln!(
             file,
+            // burst_id/burst_index are appended last so the pre-burst column
+            // positions stay valid for existing readers.
             "filename,frame_id,solution_id,exposure_ms,width,height,solved,\
              from_imu,ra_deg,dec_deg,roll_deg,fov_deg,rmse_arcsec,num_matches,\
-             solve_ms,readout_time_iso"
+             solve_ms,readout_time_iso,burst_id,burst_index"
         )
         .map_err(|e| {
             failed_precondition_error(&format!(
@@ -189,6 +249,11 @@ fn write_bench_frame(
         })?;
     }
     let iso = datetime_local.format("%Y-%m-%dT%H:%M:%S%z");
+    // Trailing burst columns, blank for frames that belong to no burst.
+    let burst_cols = match burst {
+        Some((id, index)) => format!("{},{}", id, index),
+        None => ",".to_string(),
+    };
     let row = match proto {
         Some(p) => {
             let (ra, dec) = match p.image_sky_coord.as_ref() {
@@ -202,16 +267,16 @@ fn write_bench_frame(
                 .map(|d| format!("{:.2}", d.as_secs_f64() * 1000.0))
                 .unwrap_or_default();
             format!(
-                "{},{},{},{},{},{},true,{},{:.6},{:.6},{:.4},{:.4},{:.2},{},{},{}",
+                "{},{},{},{},{},{},true,{},{:.6},{:.6},{:.4},{:.4},{:.2},{},{},{},{}",
                 filename, frame_id, solution_id, exposure_ms, width, height,
                 from_imu, ra, dec, p.roll, p.fov, p.rmse, p.num_matches,
-                solve_ms, iso
+                solve_ms, iso, burst_cols
             )
         }
         None => format!(
-            "{},{},{},{},{},{},false,{},,,,,,,,{}",
+            "{},{},{},{},{},{},false,{},,,,,,,,{},{}",
             filename, frame_id, solution_id, exposure_ms, width, height,
-            from_imu, iso
+            from_imu, iso, burst_cols
         ),
     };
     writeln!(file, "{}", row).map_err(|e| {
@@ -281,6 +346,10 @@ enum BenchAction {
 // Pure cap/interval decision, factored out for testing. Caps are checked before
 // the interval so a full corpus reports AtCap (used to log "complete" once)
 // rather than silently waiting on the interval.
+//
+// `burst_remaining` > 0 means we are partway through a burst: take the frame
+// immediately, since burst members must be consecutive camera frames to be
+// useful for stacking. The interval only gates the *start* of a burst.
 fn bench_action(
     config: &BenchConfig,
     last_save: Option<Instant>,
@@ -288,6 +357,7 @@ fn bench_action(
     solved_count: u32,
     unsolved_count: u32,
     solved: bool,
+    burst_remaining: u32,
 ) -> BenchAction {
     let at_cap = if solved {
         solved_count >= config.max_solved
@@ -296,6 +366,9 @@ fn bench_action(
     };
     if at_cap {
         return BenchAction::AtCap;
+    }
+    if burst_remaining > 0 {
+        return BenchAction::Save;
     }
     if let Some(last) = last_save {
         if now.duration_since(last) < config.interval {
@@ -350,17 +423,25 @@ fn maybe_capture_bench_frame(state: &mut SolveState) {
         state.bench_solved_count,
         state.bench_unsolved_count,
         solved,
+        state.bench_burst.remaining,
     ) {
         // At the per-category cap: don't save. The small unsolved cap is the
         // safeguard against a capped-lens session flooding the disk with darks.
+        // This can land partway through a burst, which then ends short.
         BenchAction::AtCap => {
+            if state.bench_burst.in_flight() {
+                finish_burst(state, now);
+            }
             maybe_log_bench_done(state, &config);
             return;
         }
-        // Interval hasn't elapsed since the last save yet.
+        // Interval hasn't elapsed since the last burst yet.
         BenchAction::TooSoon => return,
         BenchAction::Save => {}
     }
+
+    // Opening a new burst, or continuing the one in flight.
+    let burst = state.bench_burst.claim(config.burst);
 
     match write_bench_frame(
         &config.dir,
@@ -372,23 +453,42 @@ fn maybe_capture_bench_frame(state: &mut SolveState) {
         readout_time,
         from_imu,
         proto.as_ref(),
+        Some(burst),
     ) {
         Ok(path) => {
             state.bench_seq += 1;
-            state.bench_last_save = Some(now);
             if solved {
                 state.bench_solved_count += 1;
             } else {
                 state.bench_unsolved_count += 1;
             }
-            debug!("Saved bench frame {:?} (solved={})", path, solved);
+            // The interval is measured from the end of the burst, so bursts are
+            // separated by `interval` regardless of how long one takes.
+            if state.bench_burst.written() {
+                finish_burst(state, now);
+            }
+            debug!(
+                "Saved bench frame {:?} (solved={}, burst {}.{})",
+                path, solved, burst.0, burst.1
+            );
             maybe_log_bench_done(state, &config);
         }
         Err(e) => {
-            // A benchmark-capture failure must never break plate solving.
+            // A benchmark-capture failure must never break plate solving. End
+            // the burst rather than retrying on every subsequent frame: a
+            // persistent I/O error would otherwise spam this warning at the
+            // full frame rate.
             warn!("Benchmark capture failed: {:?}", e);
+            finish_burst(state, now);
         }
     }
+}
+
+// Closes out the current burst: starts the inter-burst interval and moves to a
+// fresh burst id.
+fn finish_burst(state: &mut SolveState, now: Instant) {
+    state.bench_burst.end();
+    state.bench_last_save = Some(now);
 }
 // Observation-log hook: record the just-stored PlateSolution. The
 // ObservationLog decides internally whether to write (enabled? IMU? throttle?),
@@ -518,6 +618,9 @@ struct SolveState {
     bench_unsolved_count: u32,
     bench_seq: u64,
     bench_done_logged: bool,
+    // The burst in flight, so consumers can group the back-to-back frames that
+    // are candidates for stacking.
+    bench_burst: BurstTracker,
 
     // Observation log: records each real plate solve (throttled) to a local
     // JSON Lines file. Shared with the gRPC handler, which logs GoTo requests
@@ -577,6 +680,7 @@ impl SolveEngine {
                 bench_unsolved_count: 0,
                 bench_seq: 0,
                 bench_done_logged: false,
+                bench_burst: BurstTracker::default(),
                 observation_log,
             })),
             detect_engine,
@@ -855,6 +959,8 @@ impl SolveEngine {
                         write_bench_frame(
                             d, seq, &image, frame_id, solution_id, exposure_ms,
                             readout_time, from_imu, proto.as_ref(),
+                            // On-demand save: belongs to no burst.
+                            /*burst=*/ None,
                         )?;
                         locked_state.bench_seq += 1;
                         Ok(())
@@ -891,7 +997,7 @@ impl SolveEngine {
                 write_bench_frame(
                     d, seq, image, detect_result.frame_id, /*solution_id=*/ -1,
                     exposure_ms, readout_time, /*from_imu=*/ false,
-                    /*proto=*/ None,
+                    /*proto=*/ None, /*burst=*/ None,
                 )?;
                 locked_state.bench_seq += 1;
                 Ok(())
@@ -2124,6 +2230,7 @@ mod bench_tests {
         BenchConfig {
             dir: PathBuf::from("/unused"),
             interval,
+            burst: 3,
             max_solved,
             max_unsolved,
         }
@@ -2133,7 +2240,7 @@ mod bench_tests {
     fn saves_when_no_prior_frame() {
         let c = cfg(Duration::from_secs(2), 10, 10);
         assert_eq!(
-            bench_action(&c, None, Instant::now(), 0, 0, true),
+            bench_action(&c, None, Instant::now(), 0, 0, true, 0),
             BenchAction::Save
         );
     }
@@ -2143,7 +2250,7 @@ mod bench_tests {
         let c = cfg(Duration::from_secs(10), 10, 10);
         let now = Instant::now();
         assert_eq!(
-            bench_action(&c, Some(now), now, 0, 0, true),
+            bench_action(&c, Some(now), now, 0, 0, true, 0),
             BenchAction::TooSoon
         );
     }
@@ -2154,8 +2261,32 @@ mod bench_tests {
         let c = cfg(Duration::ZERO, 10, 10);
         let now = Instant::now();
         assert_eq!(
-            bench_action(&c, Some(now), now, 0, 0, true),
+            bench_action(&c, Some(now), now, 0, 0, true, 0),
             BenchAction::Save
+        );
+    }
+
+    #[test]
+    fn mid_burst_ignores_interval() {
+        // Burst members must be consecutive frames, so the interval that gates
+        // the start of a burst must not gate its remaining frames.
+        let c = cfg(Duration::from_secs(10), 10, 10);
+        let now = Instant::now();
+        assert_eq!(
+            bench_action(&c, Some(now), now, 0, 0, true, 2),
+            BenchAction::Save
+        );
+    }
+
+    #[test]
+    fn caps_stop_a_burst_in_flight() {
+        // Caps outrank the burst: a corpus that fills partway through a burst
+        // ends the burst short rather than overshooting.
+        let c = cfg(Duration::ZERO, 3, 2);
+        let now = Instant::now();
+        assert_eq!(
+            bench_action(&c, None, now, 3, 0, true, 2),
+            BenchAction::AtCap
         );
     }
 
@@ -2165,22 +2296,59 @@ mod bench_tests {
         let now = Instant::now();
         // Solved bucket full, unsolved bucket not.
         assert_eq!(
-            bench_action(&c, None, now, 3, 0, true),
+            bench_action(&c, None, now, 3, 0, true, 0),
             BenchAction::AtCap
         );
         assert_eq!(
-            bench_action(&c, None, now, 3, 0, false),
+            bench_action(&c, None, now, 3, 0, false, 0),
             BenchAction::Save
         );
         // Unsolved bucket full (the dark-frame safeguard), solved bucket not.
         assert_eq!(
-            bench_action(&c, None, now, 0, 2, false),
+            bench_action(&c, None, now, 0, 2, false, 0),
             BenchAction::AtCap
         );
         assert_eq!(
-            bench_action(&c, None, now, 0, 2, true),
+            bench_action(&c, None, now, 0, 2, true, 0),
             BenchAction::Save
         );
+    }
+
+    #[test]
+    fn burst_numbers_frames_then_advances_id() {
+        let mut b = BurstTracker::default();
+        // One full burst of 3: indices 0,1,2 under a single id.
+        assert_eq!(b.claim(3), (0, 0));
+        assert!(!b.written());
+        assert_eq!(b.claim(3), (0, 1));
+        assert!(!b.written());
+        assert_eq!(b.claim(3), (0, 2));
+        assert!(b.written(), "third frame completes the burst");
+        b.end();
+        // The next burst is a distinct group, numbered from 0 again.
+        assert_eq!(b.claim(3), (1, 0));
+    }
+
+    #[test]
+    fn burst_of_one_is_the_pre_burst_behavior() {
+        let mut b = BurstTracker::default();
+        assert_eq!(b.claim(1), (0, 0));
+        assert!(b.written(), "a burst of 1 completes on its only frame");
+        b.end();
+        assert_eq!(b.claim(1), (1, 0));
+    }
+
+    #[test]
+    fn burst_ended_early_does_not_reuse_its_id() {
+        // A cap or write error can end a burst mid-flight; the partial group
+        // must not be merged with the next one in the manifest.
+        let mut b = BurstTracker::default();
+        assert_eq!(b.claim(5), (0, 0));
+        assert!(!b.written());
+        assert_eq!(b.claim(5), (0, 1));
+        b.end(); // abandoned before the remaining 3 frames
+        assert!(!b.in_flight());
+        assert_eq!(b.claim(5), (1, 0));
     }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
@@ -2220,6 +2388,7 @@ mod bench_tests {
 
         let path = write_bench_frame(
             &dir, 0, &img, 42, 7, 100, readout, false, Some(&proto),
+            Some((5, 1)),
         )
         .expect("write should succeed");
         assert!(path.exists(), "PNG should be written");
@@ -2244,6 +2413,8 @@ mod bench_tests {
         assert_eq!(cols[9], "28.950000"); // dec_deg
         assert_eq!(cols[13], "17"); // num_matches
         assert_eq!(cols[14], "45.00"); // solve_ms
+        assert_eq!(cols[16], "5"); // burst_id
+        assert_eq!(cols[17], "1"); // burst_index
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2254,10 +2425,16 @@ mod bench_tests {
         let img = GrayImage::new(4, 4);
         let readout = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
-        let p0 = write_bench_frame(&dir, 0, &img, 1, -1, 50, readout, false, None)
-            .unwrap();
-        let p1 = write_bench_frame(&dir, 1, &img, 2, -1, 50, readout, false, None)
-            .unwrap();
+        // Two members of the same burst: unsolved, so the ground-truth columns
+        // are blank but the burst grouping still identifies them as stackable.
+        let p0 =
+            write_bench_frame(&dir, 0, &img, 1, -1, 50, readout, false, None,
+                              Some((0, 0)))
+                .unwrap();
+        let p1 =
+            write_bench_frame(&dir, 1, &img, 2, -1, 50, readout, false, None,
+                              Some((0, 1)))
+                .unwrap();
         assert_ne!(p0, p1, "seq must make filenames unique");
 
         let manifest = std::fs::read_to_string(dir.join("manifest.csv")).unwrap();
@@ -2271,6 +2448,12 @@ mod bench_tests {
         assert_eq!(cols[9], ""); // dec_deg blank
         assert_eq!(cols[13], ""); // num_matches blank
         assert_eq!(cols[14], ""); // solve_ms blank
+        assert_eq!(cols[16], "0"); // burst_id
+        assert_eq!(cols[17], "0"); // burst_index
+        // Second row is the next member of the same burst.
+        let cols1: Vec<&str> = lines[2].split(',').collect();
+        assert_eq!(cols1[16], "0"); // same burst_id
+        assert_eq!(cols1[17], "1"); // next burst_index
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -48,7 +48,7 @@ env:
   TETRA3_SERVER_REPO: smroid/tetra3_server
   TETRA3_SERVER_REF: 6afa9aed0150c5b7a10a48acd9fcdacd7895bb66
   ASI_CAMERA2_REPO: smroid/asi_camera2
-  ASI_CAMERA2_REF: 53ade51
+  ASI_CAMERA2_REF: 53ade516b0a044167c6abb2a753598cca74bac0e
 
 jobs:
   build-lint-test:

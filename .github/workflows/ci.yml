@@ -115,7 +115,11 @@ jobs:
       # --- Rust toolchains ------------------------------------------------
       # Stable for clippy + tests; nightly for rustfmt (rustfmt.toml uses
       # unstable options: wrap_comments, group_imports, imports_granularity,
-      # error_on_line_overflow, ...).
+      # error_on_line_overflow, ...). dtolnay/rust-toolchain sets the
+      # LAST-installed toolchain as the rustup default, so nightly (installed
+      # second, for rustfmt) becomes default and lacks clippy. Each cargo step
+      # below therefore pins its toolchain explicitly (`+stable` / `+nightly`)
+      # rather than relying on the default.
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -155,7 +159,7 @@ jobs:
       # `-- -D warnings` to the command below.
       - name: clippy
         working-directory: cedar-server
-        run: cargo clippy --workspace --all-targets
+        run: cargo +stable clippy --workspace --all-targets
 
       # --- unit + fast e2e tests (blocking) -------------------------------
       # Runs cedar-server + cedar-elements unit tests and the self-contained
@@ -163,4 +167,4 @@ jobs:
       # tetra3rs, staged corpora) are #[ignore]d and stay skipped here.
       - name: Run tests
         working-directory: cedar-server
-        run: cargo test --workspace
+        run: cargo +stable test --workspace

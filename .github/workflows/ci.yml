@@ -101,16 +101,19 @@ jobs:
           path: asi_camera2
 
       # --- System build dependencies --------------------------------------
-      # protoc (tonic/prost), libdbus (bluer), cmake+nasm+jpeg+zlib (turbojpeg
-      # static build), libclang (bindgen). These are the default-feature build
-      # deps; the hardware camera backends (rpi-camera/asi-camera) are NOT
-      # built here, so system libcamera / the ASI SDK are not required.
+      # protoc (tonic/prost) + libprotobuf-dev (ships the well-known
+      # google/protobuf/*.proto imported by cedar_detect.proto; without it
+      # protoc fails with "google/protobuf/duration.proto: File not found"),
+      # libdbus (bluer), cmake+nasm+jpeg+zlib (turbojpeg static build), libclang
+      # (bindgen). These are the default-feature build deps; the hardware camera
+      # backends (rpi-camera/asi-camera) are NOT built here, so system libcamera
+      # / the ASI SDK are not required.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libdbus-1-dev cmake nasm libjpeg-dev zlib1g-dev \
-            protobuf-compiler libclang-dev
+            protobuf-compiler libprotobuf-dev libclang-dev
 
       # --- Rust toolchains ------------------------------------------------
       # Stable for clippy + tests; nightly for rustfmt (rustfmt.toml uses

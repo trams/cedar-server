@@ -1,0 +1,166 @@
+name: CI
+
+# Run linters (clippy, rustfmt) and unit tests for pull requests and for the
+# main branch.
+#
+# Why this is more involved than a normal single-crate workflow: cedar-server
+# depends on several SIBLING repositories by relative path
+# (../../cedar-camera, ../../cedar-detect, ../../tetra3rs, ../../tetra3_server,
+# and, as an optional path dep whose manifest must still exist on disk,
+# ../asi_camera2). None of those are present when GitHub checks out this repo
+# alone, so the job checks each one out next to cedar-server, reproducing the
+# on-disk layout the Cargo path deps expect:
+#
+#   $GITHUB_WORKSPACE/
+#     cedar-server/     <- this repo (the PR / push ref)
+#     cedar-camera/
+#     cedar-detect/
+#     tetra3rs/
+#     tetra3_server/    <- references ../cedar-server/elements, hence the dir
+#     asi_camera2/         name below MUST be exactly "cedar-server"
+#
+# The sibling repos are pinned to known-good commits (verified to build & test
+# against this branch on 2026-07-22). Bump these when cedar-server needs a newer
+# sibling API.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs for the same PR / branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Statically link libjpeg-turbo (SIMD JPEG), matching build.sh.
+  TURBOJPEG_STATIC: "1"
+  CARGO_TERM_COLOR: always
+  # Pinned sibling commits. Keep in sync with the versions cedar-server builds
+  # against; bump as needed.
+  CEDAR_CAMERA_REPO: trams/cedar-camera
+  CEDAR_CAMERA_REF: 92b28b0bbef5c7166170088d812cba7d53a77aed
+  CEDAR_DETECT_REPO: smroid/cedar-detect
+  CEDAR_DETECT_REF: 41fc3d66ffc125c07dc0779aa962ada23335df4c
+  TETRA3RS_REPO: ssmichael1/tetra3rs
+  TETRA3RS_REF: 1070fb412a0eeb5092209a976a7f39b4aedc53eb
+  TETRA3_SERVER_REPO: smroid/tetra3_server
+  TETRA3_SERVER_REF: 6afa9aed0150c5b7a10a48acd9fcdacd7895bb66
+  ASI_CAMERA2_REPO: smroid/asi_camera2
+  ASI_CAMERA2_REF: 53ade51
+
+jobs:
+  build-lint-test:
+    # Native ARM64 runner: cedar targets the Raspberry Pi (aarch64), so linting
+    # and testing on ARM catches arch-specific issues the product would hit in
+    # production. Free for public repositories. Swap to `ubuntu-24.04` if an
+    # x86_64 runner is ever needed.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      # --- Check out this repo and every sibling it depends on -------------
+      - name: Checkout cedar-server
+        uses: actions/checkout@v4
+        with:
+          path: cedar-server
+
+      - name: Checkout cedar-camera
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CEDAR_CAMERA_REPO }}
+          ref: ${{ env.CEDAR_CAMERA_REF }}
+          path: cedar-camera
+
+      - name: Checkout cedar-detect
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CEDAR_DETECT_REPO }}
+          ref: ${{ env.CEDAR_DETECT_REF }}
+          path: cedar-detect
+
+      - name: Checkout tetra3rs
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TETRA3RS_REPO }}
+          ref: ${{ env.TETRA3RS_REF }}
+          path: tetra3rs
+
+      - name: Checkout tetra3_server
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TETRA3_SERVER_REPO }}
+          ref: ${{ env.TETRA3_SERVER_REF }}
+          path: tetra3_server
+
+      - name: Checkout asi_camera2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ASI_CAMERA2_REPO }}
+          ref: ${{ env.ASI_CAMERA2_REF }}
+          path: asi_camera2
+
+      # --- System build dependencies --------------------------------------
+      # protoc (tonic/prost), libdbus (bluer), cmake+nasm+jpeg+zlib (turbojpeg
+      # static build), libclang (bindgen). These are the default-feature build
+      # deps; the hardware camera backends (rpi-camera/asi-camera) are NOT
+      # built here, so system libcamera / the ASI SDK are not required.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libdbus-1-dev cmake nasm libjpeg-dev zlib1g-dev \
+            protobuf-compiler libclang-dev
+
+      # --- Rust toolchains ------------------------------------------------
+      # Stable for clippy + tests; nightly for rustfmt (rustfmt.toml uses
+      # unstable options: wrap_comments, group_imports, imports_granularity,
+      # error_on_line_overflow, ...).
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cedar-server
+
+      # --- rustfmt (advisory) ---------------------------------------------
+      # NOTE: the existing codebase predates its own strict rustfmt.toml and
+      # does not currently pass `cargo fmt --check` under recent nightly (every
+      # file reflows). This step is therefore advisory (continue-on-error) so it
+      # surfaces formatting drift without blocking merges. Once the tree is
+      # reformatted, drop continue-on-error to make it a hard gate.
+      - name: rustfmt (check)
+        continue-on-error: true
+        working-directory: cedar-server
+        run: cargo +nightly fmt --package cedar-server --package cedar-elements --check
+
+      # --- clippy ---------------------------------------------------------
+      # Runs clippy over the whole workspace and all targets. Clippy warnings
+      # are surfaced as inline annotations on the PR; the step fails (and blocks
+      # the merge) on any clippy *error* or compile error.
+      #
+      # We intentionally do NOT pass `-D warnings`: the existing tree predates
+      # linting and carries many pre-existing clippy warnings (needless_borrow,
+      # unused_async, ptr_arg, ...) plus warnings in prost/tonic-generated proto
+      # code. Denying warnings would make every run red on that legacy debt. To
+      # tighten this into a hard gate once the tree is cleaned up, append
+      # `-- -D warnings` to the command below.
+      - name: clippy
+        working-directory: cedar-server
+        run: cargo clippy --workspace --all-targets
+
+      # --- unit + fast e2e tests (blocking) -------------------------------
+      # Runs cedar-server + cedar-elements unit tests and the self-contained
+      # observation-log e2e test. The heavyweight e2e suites (real tetra3 /
+      # tetra3rs, staged corpora) are #[ignore]d and stay skipped here.
+      - name: Run tests
+        working-directory: cedar-server
+        run: cargo test --workspace

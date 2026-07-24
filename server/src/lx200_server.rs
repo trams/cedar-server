@@ -393,9 +393,7 @@ impl Lx200Controller {
             let (j2000_ra, j2000_dec) = self.convert_to_j2000(ra, dec);
             debug!("Slewing to {}, {}", j2000_ra, j2000_dec);
             let mut locked_position = self.telescope_position.lock().await;
-            locked_position.slew_target_ra = j2000_ra;
-            locked_position.slew_target_dec = j2000_dec;
-            locked_position.slew_active = true;
+            locked_position.set_slew_target(j2000_ra, j2000_dec, "lx200");
             "0".to_string()
         } else {
             "1No object#".to_string()
@@ -421,7 +419,7 @@ impl Lx200Controller {
 
     async fn abort(&mut self) {
         let mut locked_position = self.telescope_position.lock().await;
-        locked_position.slew_active = false;
+        locked_position.clear_slew("lx200");
         debug!("Stopping slew");
     }
 
@@ -566,7 +564,7 @@ impl Lx200Controller {
 
     async fn get_distance_bars(&self) -> String {
         let locked_position = self.telescope_position.lock().await;
-        if locked_position.slew_active {
+        if locked_position.slew_active() {
             "\x7f#".to_string()
         } else {
             "#".to_string()
@@ -888,11 +886,30 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+    use crate::observation_log::ObservationLog;
 
     async fn setup_controller(
     ) -> (Lx200Controller, Arc<Mutex<TelescopePosition>>) {
         let telescope_position =
             Arc::new(Mutex::new(TelescopePosition::default()));
+        let controller = Lx200Controller::new(
+            telescope_position.clone(),
+            Box::new(move || {}),
+        );
+        (controller, telescope_position)
+    }
+
+    // As above, but the TelescopePosition carries an enabled observation log
+    // writing to `log_path`, so a test can assert on what got recorded.
+    async fn setup_controller_with_log(
+        log_path: &std::path::Path,
+    ) -> (Lx200Controller, Arc<Mutex<TelescopePosition>>) {
+        let observation_log = Arc::new(ObservationLog::for_path(
+            log_path.to_path_buf(),
+            std::time::Duration::ZERO,
+        ));
+        let telescope_position =
+            Arc::new(Mutex::new(TelescopePosition::new(observation_log)));
         let controller = Lx200Controller::new(
             telescope_position.clone(),
             Box::new(move || {}),
@@ -1098,9 +1115,10 @@ mod tests {
         // Check telescope position state
         {
             let locked_position = position_arc.lock().await;
-            assert_approx_eq(locked_position.slew_target_ra, 157.5);
-            assert_approx_eq(locked_position.slew_target_dec, -15.5);
-            assert!(locked_position.slew_active);
+            let (target_ra, target_dec) = locked_position.slew_target();
+            assert_approx_eq(target_ra, 157.5);
+            assert_approx_eq(target_dec, -15.5);
+            assert!(locked_position.slew_active());
         }
 
         let abort = controller.process_input(b":Q#").await;
@@ -1108,7 +1126,7 @@ mod tests {
 
         {
             let locked_position = position_arc.lock().await;
-            assert!(!locked_position.slew_active);
+            assert!(!locked_position.slew_active());
         }
 
         // Slew should fail if no target
@@ -1260,7 +1278,7 @@ mod tests {
 
         {
             let mut locked_position = position_arc.lock().await;
-            locked_position.slew_active = false;
+            locked_position.clear_slew("test");
         }
         assert_eq!(
             controller.process_input(b":D#").await.as_deref(),
@@ -1269,7 +1287,7 @@ mod tests {
 
         {
             let mut locked_position = position_arc.lock().await;
-            locked_position.slew_active = true;
+            locked_position.set_slew_target(0.0, 0.0, "test");
         }
         assert_eq!(
             controller.process_input(b":D#").await.as_deref(),
@@ -1450,9 +1468,80 @@ mod tests {
         // Ensure no precessing for target
         {
             let locked_position = position_arc.lock().await;
-            assert!(locked_position.slew_active);
-            assert_approx_eq(locked_position.slew_target_ra, 300.0);
-            assert_approx_eq(locked_position.slew_target_dec, -30.0);
+            assert!(locked_position.slew_active());
+            let (target_ra, target_dec) = locked_position.slew_target();
+            assert_approx_eq(target_ra, 300.0);
+            assert_approx_eq(target_dec, -30.0);
         }
+    }
+
+    // Regression test for the observation log's original blind spot: GoTos sent
+    // over LX200 (i.e. every SkySafari goto, the common case in the field) were
+    // not recorded, because only the gRPC call site was instrumented. Drives
+    // the real :Sr/:Sd/:MS and :Q command sequence and asserts the records land
+    // on disk tagged source "lx200".
+    #[tokio::test]
+    async fn test_goto_over_lx200_is_logged() {
+        let dir = std::env::temp_dir()
+            .join(format!("cedar_lx200_obslog_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("obs.jsonl");
+        let _ = std::fs::remove_file(&log_path);
+
+        let (mut controller, _position_arc) =
+            setup_controller_with_log(&log_path).await;
+        // Pin the epoch so JNow->J2000 precession is the identity and the
+        // logged coordinates are exactly what we typed.
+        controller.jnow_epoch = 2000.0;
+
+        // SkySafari's goto: set target RA, set target Dec, then slew.
+        // 10h30m -> 157.5 deg, -15d30m -> -15.5 deg.
+        assert_eq!(
+            controller.process_input(b":Sr10:30:00#").await.as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            controller.process_input(b":Sd-15*30:00#").await.as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            controller.process_input(b":MS#").await.as_deref(),
+            Some("0")
+        );
+        // ...and the user pressing stop.
+        assert_eq!(controller.process_input(b":Q#").await, None);
+
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(&log_path)
+                .unwrap_or_else(|e| panic!("read {:?}: {:?}", log_path, e))
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        assert_eq!(records.len(), 2, "expected two goto records: {:?}", records);
+
+        let initiate = &records[0];
+        assert_eq!(initiate["type"], "goto");
+        assert_eq!(initiate["action"], "initiate_slew");
+        assert_eq!(initiate["source"], "lx200");
+        assert_approx_eq(initiate["ra_deg"].as_f64().unwrap(), 157.5);
+        assert_approx_eq(initiate["dec_deg"].as_f64().unwrap(), -15.5);
+        assert!(initiate["time"].is_string());
+
+        let stop = &records[1];
+        assert_eq!(stop["action"], "stop_slew");
+        assert_eq!(stop["source"], "lx200");
+        assert!(stop.get("ra_deg").is_none());
+
+        // An abort with no slew in flight is not an event; don't log a phantom.
+        assert_eq!(controller.process_input(b":Q#").await, None);
+        let line_count = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(line_count, 2, "redundant abort should not be logged");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

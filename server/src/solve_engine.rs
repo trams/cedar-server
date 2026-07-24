@@ -39,12 +39,23 @@ use imageproc::rect::Rect;
 use log::{debug, warn};
 
 use crate::detect_engine::{DetectEngine, DetectResult};
+use crate::observation_log::ObservationLog;
 
 const IMU_INTERPOLATION_INTERVAL: Duration = Duration::from_millis(100);
 const MINIMUM_STARS: usize = 4;
+
 // Minimum angular velocity (degrees/sec) below which we suppress IMU
 // interpolation when the scope is at rest.
 const IMU_MOTION_THRESHOLD_DEG_PER_SEC: f64 = 0.5;
+
+// Observation-log hook: record the just-stored PlateSolution. The
+// ObservationLog decides internally whether to write (enabled? IMU? throttle?),
+// so this is a cheap unconditional call. Never fails the solve loop.
+fn maybe_log_observation(state: &SolveState) {
+    if let Some(ps) = state.plate_solution.as_ref() {
+        state.observation_log.log_solve(ps);
+    }
+}
 
 // Pre-solve callback: called before the plate solve to get any active slew
 // target and/or sync coordinates. Returns (slew_target, sync_coord).
@@ -148,6 +159,11 @@ struct SolveState {
     next_solution_id: i32,
     plate_solution: Option<PlateSolution>,
     logged_error: bool,
+
+    // Observation log: records each real plate solve (throttled) to a local
+    // JSON Lines file. Shared with the TelescopePosition, which logs GoTo
+    // requests to the same file. Always present; a no-op when disabled.
+    observation_log: Arc<ObservationLog>,
 }
 
 impl SolveEngine {
@@ -161,6 +177,7 @@ impl SolveEngine {
         pre_solve_callback: PreSolveCallback,
         post_solve_callback: PostSolveCallback,
         observer_location: Option<LatLong>,
+        observation_log: Arc<ObservationLog>,
     ) -> Result<Self, CanonicalError> {
         Ok(SolveEngine {
             solver,
@@ -194,6 +211,7 @@ impl SolveEngine {
                 next_solution_id: 0,
                 plate_solution: None,
                 logged_error: false,
+                observation_log,
             })),
             detect_engine,
             hot_pixel_map,
@@ -1068,6 +1086,11 @@ impl SolveEngine {
             solve_success_stats,
             solve_interval_stats,
         });
+
+        // Observation log: record this solve (skips IMU interpolations and
+        // applies its own throttle). Runs here because the just-stored
+        // PlateSolution has the frame and its solution paired.
+        maybe_log_observation(&locked_state);
     }
 
     async fn worker(

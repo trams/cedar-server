@@ -11,7 +11,10 @@ use ascom_alpaca::api::{AlignmentMode, Axis, CargoServerInfo,
                         Device, EquatorialSystem, Telescope};
 use async_trait::async_trait;
 
-#[derive(Default, Debug)]
+use crate::observation_log::ObservationLog;
+use cedar_elements::cedar_common::CelestialCoord;
+
+#[derive(Debug)]
 pub struct TelescopePosition {
     // The telescope's boresight position is determined by Cedar.
     pub boresight_ra: f64,  // 0..360
@@ -26,9 +29,13 @@ pub struct TelescopePosition {
 
     // A slew is initiated by SkySafari. The slew can be terminated either by
     // SkySafari or Cedar.
-    pub slew_target_ra: f64,  // 0..360
-    pub slew_target_dec: f64, // -90..90
-    pub slew_active: bool,
+    //
+    // These are deliberately private: every slew must go through
+    // set_slew_target()/clear_slew() so it lands in the observation log. Read
+    // them via slew_target()/slew_active().
+    slew_target_ra: f64,  // 0..360
+    slew_target_dec: f64, // -90..90
+    slew_active: bool,
 
     // The "Set Time & Location" option must be enabled in the SkySafari
     // telescope preset options. These values are set by SkySafari and are
@@ -47,12 +54,77 @@ pub struct TelescopePosition {
 
     // SkySafari doesn't seem to use this.
     pub utc_date: Option<SystemTime>,
+
+    // Observation log for GoTo records. Shared with the solve engine, which
+    // writes solve records to the same file. A disabled log by default, so
+    // TelescopePosition::default() (tests) never touches the disk.
+    observation_log: Arc<ObservationLog>,
+}
+
+impl Default for TelescopePosition {
+    fn default() -> Self {
+        TelescopePosition{
+            boresight_ra: 0.0, boresight_dec: 0.0, boresight_valid: false,
+            snapshot_dec: None,
+            slew_target_ra: 0.0, slew_target_dec: 0.0, slew_active: false,
+            site_latitude: None, site_longitude: None,
+            sync_ra: None, sync_dec: None,
+            target_ra: 0.0, target_dec: 0.0,
+            utc_date: None,
+            observation_log: Arc::new(ObservationLog::disabled()),
+        }
+    }
 }
 
 impl TelescopePosition {
-    pub fn new() -> Self {
+    pub fn new(observation_log: Arc<ObservationLog>) -> Self {
         // Sky Safari doesn't display (0.0, 0.0).
-        TelescopePosition{boresight_ra: 180.0, boresight_dec: 0.0, ..Default::default()}
+        TelescopePosition{boresight_ra: 180.0, boresight_dec: 0.0,
+                          observation_log, ..Default::default()}
+    }
+
+    /// The observation log this position writes GoTo records to, for sharing
+    /// with the solve engine (which writes solve records to the same file).
+    pub fn observation_log(&self) -> Arc<ObservationLog> {
+        self.observation_log.clone()
+    }
+
+    /// Starts (or retargets) a slew to the given J2000 coordinates, recording it
+    /// in the observation log. `source` names the protocol the request arrived
+    /// on: "grpc", "lx200" or "alpaca".
+    ///
+    /// This is the single entry point for starting a slew. Cedar speaks three
+    /// telescope protocols and an earlier version of the observation log
+    /// instrumented only the gRPC call site, so SkySafari GoTos — the common
+    /// case in the field — went unrecorded. Keep the slew fields private and
+    /// the logging here, and a fourth protocol cannot repeat that.
+    pub fn set_slew_target(&mut self, ra_deg: f64, dec_deg: f64, source: &str) {
+        self.slew_target_ra = ra_deg;
+        self.slew_target_dec = dec_deg;
+        self.slew_active = true;
+        self.observation_log.log_goto(
+            "initiate_slew", source,
+            Some(&CelestialCoord{ra: ra_deg, dec: dec_deg, epoch: None}));
+    }
+
+    /// Ends any active slew, recording it in the observation log. A no-op (and
+    /// unlogged) when no slew was active, so that housekeeping clears and
+    /// redundant stop requests don't pad the log with phantom events.
+    pub fn clear_slew(&mut self, source: &str) {
+        if !self.slew_active {
+            return;
+        }
+        self.slew_active = false;
+        self.observation_log.log_goto("stop_slew", source, None);
+    }
+
+    /// The current slew target (J2000 degrees), whether or not a slew is active.
+    pub fn slew_target(&self) -> (f64, f64) {
+        (self.slew_target_ra, self.slew_target_dec)
+    }
+
+    pub fn slew_active(&self) -> bool {
+        self.slew_active
     }
 }
 
@@ -233,7 +305,12 @@ impl Telescope for MyTelescope {
     async fn slew_to_target_async(&self) -> ASCOMResult {
         debug!("slew_to_target_async");
         let mut locked_position = self.telescope_position.lock().await;
-        locked_position.slew_active = true;
+        // Slew to the previously-set target coordinates. Historically this only
+        // raised slew_active, leaving slew_target_* at whatever they were; go
+        // through the seam so the target is explicit and the GoTo is logged.
+        let (target_ra, target_dec) =
+            (locked_position.target_ra, locked_position.target_dec);
+        locked_position.set_slew_target(target_ra, target_dec, "alpaca");
         Ok(())
     }
 
@@ -245,19 +322,18 @@ impl Telescope for MyTelescope {
                                        -> ASCOMResult {
         debug!("slew_to_coordinates_async {} {}", right_ascension, declination);
         let mut locked_position = self.telescope_position.lock().await;
-        locked_position.slew_target_ra = right_ascension * 15.0;
-        locked_position.slew_target_dec = declination;
-        locked_position.slew_active = true;
+        locked_position.set_slew_target(
+            right_ascension * 15.0, declination, "alpaca");
         Ok(())
     }
     async fn slewing(&self) -> ASCOMResult<bool> {
         let locked_position = self.telescope_position.lock().await;
-        Ok(locked_position.slew_active)
+        Ok(locked_position.slew_active())
     }
     async fn abort_slew(&self) -> ASCOMResult {
         debug!("abort_slew");
         let mut locked_position = self.telescope_position.lock().await;
-        locked_position.slew_active = false;
+        locked_position.clear_slew("alpaca");
         Ok(())
     }
 

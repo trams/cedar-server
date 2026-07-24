@@ -79,6 +79,7 @@ use crate::{
     detect_engine::{DetectEngine, DetectResult},
     lx200_server::create_lx200_server,
     motion_estimator::MotionEstimator,
+    observation_log::ObservationLog,
     polar_analyzer::PolarAnalyzer,
     position_reporter::{create_alpaca_server, TelescopePosition},
     serve_engine::{ServeContext, ServeEngine},
@@ -878,10 +879,12 @@ impl MyCedar {
                     let observer_location =
                         fixed_settings.lock().await.observer_location.clone();
 
+                    let (slew_ra, slew_dec) =
+                        locked_telescope_pos.slew_target();
                     let slew_target = Self::select_slew_target(
-                        locked_telescope_pos.slew_active,
-                        locked_telescope_pos.slew_target_ra,
-                        locked_telescope_pos.slew_target_dec,
+                        locked_telescope_pos.slew_active(),
+                        slew_ra,
+                        slew_dec,
                         &mut locked_alt_az,
                         observer_location.as_ref(),
                         &frame_time,
@@ -941,6 +944,12 @@ impl MyCedar {
             },
         );
 
+        // Observation log, shared between the solve engine (solve records) and
+        // the TelescopePosition (GoTo records, from whichever protocol asked).
+        // It is constructed with the TelescopePosition in main() and borrowed
+        // from it here, so there is exactly one instance writing the file.
+        let observation_log = telescope_position.lock().await.observation_log();
+
         let solve_engine = Arc::new(tokio::sync::Mutex::new(
             SolveEngine::new(
                 solver.clone(),
@@ -952,6 +961,7 @@ impl MyCedar {
                 pre_solve_callback,
                 post_solve_callback,
                 copied_preferences.observer_location.clone(),
+                observation_log.clone(),
             )
             .unwrap(),
         ));
@@ -1862,8 +1872,13 @@ async fn async_main(
         );
     }
 
-    let shared_telescope_position =
-        Arc::new(tokio::sync::Mutex::new(TelescopePosition::new()));
+    // Observation log (see observation_log.rs), configured from the
+    // environment. It lives on the TelescopePosition so that GoTos arriving on
+    // any of our three telescope protocols get recorded; MyCedar::new() borrows
+    // it back from there for the solve engine.
+    let shared_telescope_position = Arc::new(tokio::sync::Mutex::new(
+        TelescopePosition::new(Arc::new(ObservationLog::from_env())),
+    ));
 
     // Apparently when a client cancels a gRPC request (e.g. timeout), the
     // corresponding server-side tokio task is cancelled. Per

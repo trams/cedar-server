@@ -9,6 +9,7 @@ pub mod cpu_stats;
 pub mod detect_engine;
 pub mod lx200_server;
 pub mod motion_estimator;
+pub mod observation_log;
 pub mod polar_analyzer;
 pub mod position_reporter;
 pub mod rate_estimator;

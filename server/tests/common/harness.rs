@@ -20,6 +20,7 @@ use cedar_elements::{
 };
 use cedar_server::{
     detect_engine::{DetectEngine, DetectResult},
+    observation_log::ObservationLog,
     solve_engine::{PlateSolution, SlewTargetInfo, SolveEngine},
 };
 use image::GrayImage;
@@ -138,6 +139,8 @@ impl Stack {
             post_solve,
             // observer_location=
             None,
+            // observation_log=
+            Arc::new(ObservationLog::disabled()),
         )
         .expect("SolveEngine::new");
 

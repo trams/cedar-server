@@ -237,10 +237,12 @@ impl MyCedar {
             // Only one goto at a time; this supersedes any alt/az goto.
             *alt_az_slew_target_arc.lock().await = None;
             let slew_coord = celestial_coord_to_j2000(&slew_coord);
-            let mut telescope = telescope_pos_arc.lock().await;
-            telescope.slew_target_ra = slew_coord.ra;
-            telescope.slew_target_dec = slew_coord.dec;
-            telescope.slew_active = true;
+            // set_slew_target() writes the observation log's GoTo record.
+            telescope_pos_arc.lock().await.set_slew_target(
+                slew_coord.ra,
+                slew_coord.dec,
+                "grpc",
+            );
         }
         if let Some(slew_alt_az) = req.initiate_slew_alt_az {
             if !(-90.0..=90.0).contains(&slew_alt_az.altitude) {
@@ -272,7 +274,8 @@ impl MyCedar {
                 ));
             }
             // Only one goto at a time; this supersedes any RA/Dec goto.
-            telescope_pos_arc.lock().await.slew_active = false;
+            // clear_slew() no-ops (and stays unlogged) if none was active.
+            telescope_pos_arc.lock().await.clear_slew("grpc");
             *alt_az_slew_target_arc.lock().await = Some(slew_alt_az);
         }
         if req.stop_slew.unwrap_or(false) {
@@ -283,7 +286,7 @@ impl MyCedar {
                     locked_state.alt_az_slew_target.clone(),
                 )
             };
-            telescope_position_arc.lock().await.slew_active = false;
+            telescope_position_arc.lock().await.clear_slew("grpc");
             *alt_az_slew_target_arc.lock().await = None;
         }
         if req.save_image.unwrap_or(false) {

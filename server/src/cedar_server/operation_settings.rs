@@ -164,7 +164,12 @@ impl MyCedar {
                                 .await;
                         }
                     }
-                    telescope_position_arc.lock().await.slew_active = false;
+                    // Entering SETUP cancels any slew in flight. Logged (as
+                    // source "mode_change") only if one actually was.
+                    telescope_position_arc
+                        .lock()
+                        .await
+                        .clear_slew("mode_change");
                     *alt_az_slew_target_arc.lock().await = None;
                 } else if new_operating_mode == OperatingMode::Operate as i32 {
                     // Transition: SETUP -> OPERATE mode.

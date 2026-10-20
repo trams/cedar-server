@@ -766,6 +766,8 @@ mod tests {
             crval_rad: [0.0; 2],
             camera_model: tetra3::CameraModel::from_fov(0.2, 100, 100),
             theta_rad: 0.0,
+            attitude_cov_rad2: [[0.0; 3]; 3],
+            observer_velocity_km_s: None,
         }
     }
 

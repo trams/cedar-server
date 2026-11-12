@@ -1,5 +1,11 @@
 name: Build ARM release binary
 
+# FORK-ONLY VARIANT (trams/cedar-server branch `tetra3rs`): builds the tetra3rs
+# flavour. It differs from main's workflow in that it triggers on the tetra3rs
+# branch, checks out tetra3rs, builds cedar-server-tetra3rs (Provides/Conflicts
+# cedar-server) and builds cedar-tetra3rs-db, the pattern database that package
+# depends on. Lines that differ are marked "tetra3rs:".
+
 # Builds a release cedar-box-server for the Raspberry Pi, packages it as a .deb,
 # and publishes both.
 #
@@ -27,7 +33,7 @@ on:
   push:
     # `branches` and `tags` are OR-ed: this fires on a push to main and on a
     # push of any v* tag.
-    branches: [main]
+    branches: [tetra3rs]  # tetra3rs: main builds use main's copy of this file
     tags: ['v*']
   workflow_dispatch:
 
@@ -52,8 +58,19 @@ env:
   TETRA3_SERVER_REF: main
   ASI_CAMERA2_REPO: smroid/asi_camera2
   ASI_CAMERA2_REF: main
+  # tetra3rs: the solver crate, pinned. Keep in step with TETRA3RS_REF in the
+  # daily rebase job (~/cedar-ci/tetra3rs-rebase.sh), which tests this SHA.
+  TETRA3RS_REPO: ssmichael1/tetra3rs
+  TETRA3RS_REF: 6f962ca13dee0735cfd553f38f3a033e18edc41b  # v0.14.0-9
+  # tetra3rs: the star catalog the pattern database is generated from, pinned by
+  # hash, and the field-of-view range the database can solve (see
+  # server/src/bin/make_tetra3rs_db.rs for why 10-30 deg).
+  GAIA_CATALOG_URL: https://storage.googleapis.com/tetra3rs-testvecs/gaia_merged.bin
+  GAIA_CATALOG_SHA256: 95ba872e71d56cab92d706320d1e1533956fa108bc93f6b1383345ef0095faca
+  DB_MIN_FOV: 10
+  DB_MAX_FOV: 30
   # Name of the .deb this workflow builds (see packaging/deb/build-deb.sh).
-  DEB_PACKAGE: cedar-server
+  DEB_PACKAGE: cedar-server-tetra3rs  # tetra3rs
 
 jobs:
   build:
@@ -122,6 +139,14 @@ jobs:
           ref: ${{ env.ASI_CAMERA2_REF }}
           path: asi_camera2
 
+      # tetra3rs: server/Cargo.toml depends on ../../tetra3rs by path.
+      - name: Checkout tetra3rs
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TETRA3RS_REPO }}
+          ref: ${{ env.TETRA3RS_REF }}
+          path: tetra3rs
+
       # Siblings track their default branch, so "which code is this?" is not
       # answerable from this repo's SHA alone. Record what actually got built.
       - name: Record resolved sibling revisions
@@ -138,7 +163,8 @@ jobs:
                 "cedar-camera:${CEDAR_CAMERA_REF}" \
                 "cedar-detect:${CEDAR_DETECT_REF}" \
                 "tetra3_server:${TETRA3_SERVER_REF}" \
-                "asi_camera2:${ASI_CAMERA2_REF}"; do
+                "asi_camera2:${ASI_CAMERA2_REF}" \
+                "tetra3rs:${TETRA3RS_REF}"; do
               name="${pair%%:*}"; ref="${pair#*:}"
               printf '| %s | `%s` | `%s` |\n' \
                 "$name" "$ref" "$(git -C "$name" rev-parse HEAD)"
@@ -159,6 +185,7 @@ jobs:
           cargo build --release \
             --package cedar-server \
             --bin cedar-box-server \
+            --bin make-tetra3rs-db \
             --features rpi-camera
 
       # --- Verify the ABI is actually Pi-compatible -------------------------
@@ -194,6 +221,41 @@ jobs:
       #   cap_sys_time,cap_dac_override,cap_chown,cap_fowner,cap_net_bind_service+ep
       # (see build.sh), and file capabilities cannot survive an artifact zip.
       # The .deb's postinst applies them, which is the main reason to prefer it.
+      # tetra3rs: build the pattern database and package it as
+      # cedar-tetra3rs-db. Its version is the tetra3rs crate version (the
+      # database format follows it) plus the FOV range, so it only changes when
+      # one of those does.
+      - name: Cache Gaia catalog
+        uses: actions/cache@v4
+        with:
+          path: gaia
+          key: gaia-${{ env.GAIA_CATALOG_SHA256 }}
+
+      - name: Build cedar-tetra3rs-db .deb
+        id: db
+        run: |
+          set -euo pipefail
+          mkdir --parents gaia
+          if [ ! -f gaia/gaia_merged.bin ]; then
+            curl --fail --silent --show-error --location \
+              --output gaia/gaia_merged.bin "$GAIA_CATALOG_URL"
+          fi
+          echo "${GAIA_CATALOG_SHA256}  gaia/gaia_merged.bin" | sha256sum --check
+          cedar-server/target/release/make-tetra3rs-db \
+            --gaia_catalog gaia/gaia_merged.bin \
+            --out tetra3rs_db.bin \
+            --min_fov "$DB_MIN_FOV" --max_fov "$DB_MAX_FOV"
+          t3ver=$(sed --quiet 's/^version = "\(.*\)"$/\1/p' tetra3rs/Cargo.toml | head --lines=1)
+          [ -n "$t3ver" ] || { echo "no version in tetra3rs/Cargo.toml" >&2; exit 1; }
+          major_minor=${t3ver%.*}
+          next_minor="${major_minor%.*}.$(( ${major_minor#*.} + 1 ))"
+          cedar-server/packaging/deb/build-tetra3rs-db-deb.sh \
+            --db tetra3rs_db.bin \
+            --version "${t3ver}+fov${DB_MIN_FOV}.${DB_MAX_FOV}" \
+            --out cedar-server/dist \
+            --description-note "Generated for tetra3rs ${t3ver}, fields of view ${DB_MIN_FOV}-${DB_MAX_FOV} degrees."
+          echo "depends=cedar-tetra3rs-db (>= ${major_minor}), cedar-tetra3rs-db (<< ${next_minor}~)" >> "$GITHUB_OUTPUT"
+
       - name: Build .deb
         working-directory: cedar-server
         run: |
@@ -202,7 +264,11 @@ jobs:
             --package "$DEB_PACKAGE" \
             --binary dist/cedar-box-server \
             --version "${{ steps.package.outputs.version }}" \
-            --out dist
+            --out dist \
+            --provides cedar-server \
+            --depends "${{ steps.db.outputs.depends }}" \
+            --dropin-extra packaging/deb/tetra3rs.conf \
+            --summary "Cedar plate-solving finder server, tetra3rs solver build"
 
       # Run the same ABI assertion against the binary as it sits inside the
       # .deb, so the check covers what users actually install.
@@ -219,7 +285,17 @@ jobs:
       # fails here. Also checks postinst's setcap and that removal is clean.
       - name: Test-install the .deb
         working-directory: cedar-server
-        run: packaging/deb/test-install.sh "$DEB_PACKAGE" dist/*.deb
+        run: |
+          set -euo pipefail
+          # tetra3rs: the database path the drop-in names must be in the db .deb.
+          db_path=$(sed --quiet 's/^Environment=CEDAR_TETRA3RS_DATABASE=//p' packaging/deb/tetra3rs.conf)
+          # Capture first: `dpkg-deb | grep --quiet` would kill dpkg-deb with
+          # SIGPIPE on the first match, which pipefail reports as a failure.
+          contents=$(dpkg-deb --contents dist/cedar-tetra3rs-db_*_all.deb)
+          grep --quiet " \.${db_path}\$" <<< "$contents" \
+            || { echo "::error::cedar-tetra3rs-db does not ship ${db_path}"; exit 1; }
+          packaging/deb/test-install.sh "$DEB_PACKAGE" dist/*.deb
+
       # One artifact per file, uploaded unzipped (`archive: false`, v7+), so
       # each gets its own download link. With archive off, the artifact is
       # named after the file and `name:` is ignored; `path` must match exactly
@@ -245,6 +321,14 @@ jobs:
           archive: false
           if-no-files-found: error
 
+      # tetra3rs: the database package is a fourth file.
+      - name: Upload cedar-tetra3rs-db .deb
+        uses: actions/upload-artifact@v7
+        with:
+          path: cedar-server/dist/cedar-tetra3rs-db_*_all.deb
+          archive: false
+          if-no-files-found: error
+
       # --- Release (tags only) ----------------------------------------------
       - name: Create GitHub Release
         if: github.ref_type == 'tag'
@@ -256,7 +340,10 @@ jobs:
             cedar-server/dist/*.deb
           generate_release_notes: true
           body: |
-            ARM64 (aarch64) `cedar-box-server` for Raspberry Pi OS **bookworm**.
+            ARM64 (aarch64) `cedar-box-server` for Raspberry Pi OS **bookworm**,
+            **tetra3rs build**: it solves with the built-in Rust tetra3rs solver
+            by default, using the database from `cedar-tetra3rs-db` (install
+            both `.deb` files together).
 
             Built with `--features rpi-camera` inside
             `ghcr.io/trams/cedar-build-arm64:bookworm`, so it links glibc 2.36
